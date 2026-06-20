@@ -1,4 +1,4 @@
-.PHONY: sync apply check rebuild update run
+.PHONY: sync apply check rebuild update run install-cli uninstall-cli
 
 sync:
 	./scripts/sync-upstream
@@ -20,3 +20,9 @@ update:
 
 run:
 	./scripts/run-hermes
+
+install-cli:
+	./scripts/install-patched-cli
+
+uninstall-cli:
+	./scripts/uninstall-patched-cli

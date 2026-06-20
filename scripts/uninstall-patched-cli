@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+TARGET="${HERMES_PATCHED_CLI_TARGET:-$HOME/.local/bin/hermes}"
+BACKUP="${TARGET}-upstream"
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target) TARGET="$2"; BACKUP="${TARGET}-upstream"; shift 2 ;;
+    --backup) BACKUP="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage: scripts/uninstall-patched-cli [--dry-run] [--target PATH] [--backup PATH]
+
+Restore the Hermes CLI backed up by scripts/install-patched-cli.
+EOF
+      exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -e "$BACKUP" ]] || die "backup not found: $BACKUP"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  step "Would restore upstream/default Hermes CLI"
+  printf 'target=%s\nbackup=%s\n' "$TARGET" "$BACKUP"
+  exit 0
+fi
+
+mv -f "$BACKUP" "$TARGET"
+chmod +x "$TARGET"
+ok "restored Hermes CLI from $BACKUP to $TARGET"

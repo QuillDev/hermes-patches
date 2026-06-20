@@ -32,6 +32,8 @@ scripts/check-patches     # Validate scripts, series, patch application, optiona
 scripts/update-upstream   # Dry-run or accept a new upstream base.
 scripts/edit-patch        # Print the edit workflow.
 scripts/run-hermes        # Install/sync deps and run patched Hermes.
+scripts/install-patched-cli   # Optional reversible shim: make plain `hermes ...` run patched Hermes.
+scripts/uninstall-patched-cli # Restore the previous plain `hermes` launcher after shim install.
 .work/                    # Ignored local cache/worktrees. Never commit.
 ```
 
@@ -162,18 +164,17 @@ scripts/run-hermes "gateway run --replace"
 
 ### Global `hermes` command policy
 
-Do not silently change `/Users/quill/.local/bin/hermes`. If Quill explicitly wants plain `hermes` to mean patched Hermes, prefer a reversible wrapper/shim over symlinking `~/.hermes/hermes-agent`:
+Quill's concern: many independent tools, scripts, and agents will naturally run plain commands like `hermes gateway restart` or `hermes gateway start`. If those plain commands still resolve to `/Users/quill/.local/bin/hermes` with a shebang into `/Users/quill/.hermes/hermes-agent/venv/bin/python3`, they bypass this patch repo. Service refresh alone does not fix every caller; the global CLI entrypoint also matters.
+
+Do not silently change `/Users/quill/.local/bin/hermes`. If Quill explicitly wants plain `hermes` to mean patched Hermes, install the reversible shim supplied by this repo instead of symlinking `~/.hermes/hermes-agent`:
 
 ```bash
-mv /Users/quill/.local/bin/hermes /Users/quill/.local/bin/hermes-upstream
-cat > /Users/quill/.local/bin/hermes <<'SH'
-#!/usr/bin/env bash
-exec /Users/quill/projects/hermes-patches/scripts/run-hermes "$*"
-SH
-chmod +x /Users/quill/.local/bin/hermes
+cd /Users/quill/projects/hermes-patches
+scripts/install-patched-cli --dry-run
+scripts/install-patched-cli
 ```
 
-Only do this after explicit user approval, because it globally changes every `hermes` invocation. After installing a shim, run:
+Only do this after explicit user approval, because it globally changes every `hermes` invocation. The installer backs up the previous launcher to `/Users/quill/.local/bin/hermes-upstream` by default. After installing a shim, run:
 
 ```bash
 hermes --version
@@ -183,8 +184,19 @@ hermes gateway status --full
 Rollback is:
 
 ```bash
-mv /Users/quill/.local/bin/hermes-upstream /Users/quill/.local/bin/hermes
+cd /Users/quill/projects/hermes-patches
+scripts/uninstall-patched-cli
 ```
+
+After the shim is installed, plain commands from other agents/tools route through `scripts/run-hermes`, so these now use patched Hermes:
+
+```bash
+hermes gateway start
+hermes gateway restart
+hermes gateway status --full
+```
+
+Still verify the launchd/systemd service definition after install/restart. The global CLI shim ensures future command invocations use patched Hermes; the service definition determines what the supervised background gateway process itself executes after launchd/systemd restarts it.
 
 ### Persistence checklist for future agents
 

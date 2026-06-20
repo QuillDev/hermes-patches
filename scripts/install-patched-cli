@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+TARGET="${HERMES_PATCHED_CLI_TARGET:-$HOME/.local/bin/hermes}"
+BACKUP="${TARGET}-upstream"
+DRY_RUN=0
+FORCE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target) TARGET="$2"; BACKUP="${TARGET}-upstream"; shift 2 ;;
+    --backup) BACKUP="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Usage: scripts/install-patched-cli [--dry-run] [--force] [--target PATH] [--backup PATH]
+
+Install a reversible global Hermes CLI shim that makes plain `hermes ...` route
+through this patch repository's scripts/run-hermes wrapper.
+
+Default target: $HOME/.local/bin/hermes
+Default backup: <target>-upstream
+EOF
+      exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+case "$TARGET" in
+  "$REPO_ROOT"/*|"$PATCHED_WORKTREE"/*) die "target must not be inside the patch repo or patched worktree: $TARGET" ;;
+esac
+
+SHIM_CONTENT=$(cat <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$REPO_ROOT/scripts/run-hermes" "\$@"
+EOF
+)
+
+if [[ -e "$TARGET" ]]; then
+  if [[ "$(cat "$TARGET" 2>/dev/null || true)" == "$SHIM_CONTENT" ]]; then
+    ok "$TARGET already routes to patched Hermes"
+    exit 0
+  fi
+  if [[ -e "$BACKUP" && $FORCE -ne 1 ]]; then
+    die "$BACKUP already exists; inspect it, then rerun with --force or pass --backup PATH"
+  fi
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  step "Would install patched Hermes CLI shim"
+  printf 'target=%s\nbackup=%s\nrepo=%s\npatched_worktree=%s\n' "$TARGET" "$BACKUP" "$REPO_ROOT" "$PATCHED_WORKTREE"
+  if [[ -e "$TARGET" ]]; then
+    printf 'would backup existing target to %s\n' "$BACKUP"
+  fi
+  exit 0
+fi
+
+mkdir -p "$(dirname "$TARGET")"
+if [[ -e "$TARGET" ]]; then
+  mv -f "$TARGET" "$BACKUP"
+  ok "backed up existing Hermes CLI to $BACKUP"
+fi
+printf '%s\n' "$SHIM_CONTENT" > "$TARGET"
+chmod +x "$TARGET"
+ok "installed patched Hermes CLI shim at $TARGET"
+printf 'Verify with:\n  %s --version\n  %s gateway status --full\n' "$TARGET" "$TARGET"
+printf 'Rollback with:\n  scripts/uninstall-patched-cli\n'

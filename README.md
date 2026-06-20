@@ -37,7 +37,25 @@ scripts/check-patches --verify
 
 # Run patched Hermes
 scripts/run-hermes
+
+# Optional: make plain `hermes ...` route through this patch repo.
+# Use this when other tools/agents will call `hermes gateway start|restart` directly.
+scripts/install-patched-cli --dry-run
+scripts/install-patched-cli
+
+# Roll back the global CLI shim
+scripts/uninstall-patched-cli
 ```
+
+For persistent gateway restarts, install or refresh the gateway service from patched Hermes:
+
+```bash
+scripts/run-hermes "gateway install --force"
+scripts/run-hermes "gateway restart"
+scripts/run-hermes "gateway status --full"
+```
+
+If `gateway status --full` still shows `/Users/quill/.hermes/hermes-agent` in `Program`/`ProgramArguments`, the service is not yet persistently running patched Hermes.
 
 ## Conflict repair
 
