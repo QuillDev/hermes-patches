@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+cat <<EOF
+Patch editing workflow:
+
+1. Apply patches into the editable worktree:
+   scripts/apply-patches
+
+2. Edit source in:
+   $PATCHED_WORKTREE
+
+3. Amend or create commits there. Examples:
+   cd $PATCHED_WORKTREE
+   git log --oneline --reverse $BASE_COMMIT..HEAD
+   git rebase -i $BASE_COMMIT
+   git add <files>
+   git commit --amend
+
+4. Rebuild patch files:
+   cd $REPO_ROOT
+   scripts/rebuild-patches
+
+5. Verify:
+   scripts/check-patches --verify
+EOF

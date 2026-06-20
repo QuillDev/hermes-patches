@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 14:54:34 -0700
+Subject: [PATCH 7/7] fix(photon): auto-recover wedged sidecar streams
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
+index 01c1cabbc..85a5c7ce4 100644
+--- a/plugins/platforms/photon/adapter.py
++++ b/plugins/platforms/photon/adapter.py
+@@ -85,6 +85,16 @@ _DEDUP_WINDOW_SECONDS = 48 * 3600
+ 
+ _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+ 
++# spectrum-ts retries internally when catch-up fails, so the loopback
++# ``/inbound`` stream can stay open even though no iMessages are deliverable.
++# Photon's wedged state shows up in sidecar stdout as RESOURCE_EXHAUSTED plus
++# the CatchUpEvents concurrency-limit message; cycle only the sidecar when that
++# happens instead of requiring a full gateway restart.
++_SIDECAR_RESTART_LOG_MARKERS = (
++    "resource_exhausted",
++    "catchupevents concurrency limit",
++)
++
+ # Group-chat mention wake words. When ``require_mention`` is enabled, group
+ # messages are ignored unless they match one of these patterns — same
+ # behavior and defaults as the BlueBubbles iMessage channel so the two
+@@ -220,6 +230,7 @@ class PhotonAdapter(BasePlatformAdapter):
+         # Runtime state
+         self._sidecar_proc: Optional[subprocess.Popen] = None
+         self._sidecar_supervisor_task: Optional[asyncio.Task] = None
++        self._sidecar_restart_task: Optional[asyncio.Task] = None
+         self._inbound_task: Optional[asyncio.Task] = None
+         self._inbound_running = False
+         self._http_client: Optional["httpx.AsyncClient"] = None
+@@ -364,6 +375,15 @@ class PhotonAdapter(BasePlatformAdapter):
+ 
+     async def disconnect(self) -> None:
+         self._inbound_running = False
++        if self._sidecar_restart_task is not None:
++            self._sidecar_restart_task.cancel()
++            try:
++                await self._sidecar_restart_task
++            except asyncio.CancelledError:
++                pass
++            except Exception:
++                pass
++            self._sidecar_restart_task = None
+         if self._inbound_task is not None:
+             self._inbound_task.cancel()
+             try:
+@@ -836,10 +856,57 @@ class PhotonAdapter(BasePlatformAdapter):
+                 line = await loop.run_in_executor(None, stdout.readline)
+                 if not line:
+                     break
+-                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
++                text = line.decode("utf-8", "replace").rstrip()
++                logger.info("[photon-sidecar] %s", text)
++                if self._sidecar_log_needs_restart(text):
++                    self._schedule_sidecar_restart(text)
+         except Exception as e:  # pragma: no cover - defensive
+             logger.warning("[photon-sidecar] supervisor exited: %s", e)
+ 
++    @staticmethod
++    def _sidecar_log_needs_restart(line: str) -> bool:
++        lower = line.lower()
++        return all(marker in lower for marker in _SIDECAR_RESTART_LOG_MARKERS)
++
++    def _schedule_sidecar_restart(self, reason: str) -> None:
++        """Restart a wedged sidecar once, coalescing repeated SDK log spam."""
++        if not self._inbound_running:
++            return
++        if self._sidecar_restart_task is not None and not self._sidecar_restart_task.done():
++            return
++        self._sidecar_restart_task = asyncio.get_event_loop().create_task(
++            self._restart_sidecar(reason)
++        )
++
++    async def _restart_sidecar(self, reason: str) -> None:
++        backoff = 1.0
++        try:
++            while self._inbound_running:
++                logger.warning(
++                    "[photon] restarting sidecar after wedged Spectrum stream: %s",
++                    reason,
++                )
++                try:
++                    await self._stop_sidecar()
++                    if not self._inbound_running:
++                        return
++                    await self._start_sidecar()
++                    logger.info("[photon] sidecar restarted successfully")
++                    return
++                except asyncio.CancelledError:
++                    raise
++                except Exception as exc:
++                    logger.exception(
++                        "[photon] sidecar restart failed; retrying in %.1fs: %s",
++                        backoff,
++                        exc,
++                    )
++                    await asyncio.sleep(backoff)
++                    backoff = min(backoff * 2, 30.0)
++        finally:
++            if self._sidecar_restart_task is asyncio.current_task():
++                self._sidecar_restart_task = None
++
+     async def _stop_sidecar(self) -> None:
+         proc = self._sidecar_proc
+         if proc is None:
+diff --git a/tests/plugins/platforms/photon/test_sidecar_lifecycle.py b/tests/plugins/platforms/photon/test_sidecar_lifecycle.py
+index 31b005c24..3195e61b0 100644
+--- a/tests/plugins/platforms/photon/test_sidecar_lifecycle.py
++++ b/tests/plugins/platforms/photon/test_sidecar_lifecycle.py
+@@ -169,3 +169,62 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
+     kwargs = spawned["kwargs"]
+     assert kwargs["stdin"] is subprocess.PIPE
+     assert kwargs["env"]["PHOTON_SIDECAR_WATCH_STDIN"] == "1"
++
++
++def test_concurrency_limit_log_requests_restart(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter = _make_adapter(monkeypatch)
++
++    assert adapter._sidecar_log_needs_restart(
++        "[spectrum.stream] stream persistently failing; still retrying "
++        "RateLimitError: [spectrum-imessage] catchUpEvents concurrency limit "
++        "(16) reached { grpcCode: 8, status: RESOURCE_EXHAUSTED }"
++    )
++
++
++def test_non_concurrency_sidecar_log_does_not_request_restart(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter = _make_adapter(monkeypatch)
++
++    assert not adapter._sidecar_log_needs_restart(
++        "[spectrum.stream] stream interrupted; reconnecting"
++    )
++    assert not adapter._sidecar_log_needs_restart(
++        "RESOURCE_EXHAUSTED from unrelated outbound send quota"
++    )
++
++
++@pytest.mark.asyncio
++async def test_supervisor_schedules_restart_on_wedged_stream_log(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter = _make_adapter(monkeypatch)
++    reasons: List[str] = []
++
++    def _record_restart(reason: str) -> None:
++        reasons.append(reason)
++
++    monkeypatch.setattr(adapter, "_schedule_sidecar_restart", _record_restart)
++
++    class _Stdout:
++        def __init__(self) -> None:
++            self._lines = [
++                b"ordinary startup line\n",
++                b"ClientError: /photon.imessage.v1.EventService/CatchUpEvents "
++                b"RESOURCE_EXHAUSTED: [spectrum-imessage] catchUpEvents "
++                b"concurrency limit (16) reached\n",
++                b"",
++            ]
++
++        def readline(self) -> bytes:
++            return self._lines.pop(0)
++
++    class _Proc:
++        stdout = _Stdout()
++
++    await adapter._supervise_sidecar(_Proc())  # type: ignore[arg-type]
++
++    assert len(reasons) == 1
++    assert "CatchUpEvents" in reasons[0]
+-- 
+2.50.1 (Apple Git-155)
+

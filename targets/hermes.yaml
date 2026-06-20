@@ -1,0 +1,12 @@
+name: hermes
+upstream_url: https://github.com/NousResearch/hermes-agent.git
+upstream_remote_name: upstream
+upstream_branch: main
+base_commit: 5a53e0f0f487d3d383e2a7b2eae8f260e9bf1090
+patch_dir: patches/hermes
+work_dir: .work
+upstream_cache: .work/upstream.git
+upstream_worktree: .work/hermes-upstream
+patched_worktree: .work/hermes-patched
+default_verify_cmd: uv run --extra dev --extra messaging python -m pytest tests/gateway/test_api_server.py tests/gateway/test_session_api.py tests/test_hermes_state.py -q -o addopts=
+run_cmd: uv run hermes

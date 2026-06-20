@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+ensure_upstream_cache
+step "Upstream target"
+printf 'url=%s\nbranch=%s\nconfigured_base=%s\nlatest=%s\n' "$UPSTREAM_URL" "$UPSTREAM_BRANCH" "$BASE_COMMIT" "$(current_upstream_ref)"

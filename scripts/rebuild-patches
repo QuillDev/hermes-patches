@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+[[ -d "$PATCHED_WORKTREE/.git" || -f "$PATCHED_WORKTREE/.git" ]] || die "patched worktree missing; run scripts/apply-patches first"
+[[ -z "$(git -C "$PATCHED_WORKTREE" status --porcelain --untracked-files=no)" ]] || die "tracked changes in patched worktree are uncommitted; commit them before rebuilding patches"
+BASE="$(git -C "$PATCHED_WORKTREE" merge-base --is-ancestor "$BASE_COMMIT" HEAD && echo "$BASE_COMMIT" || true)"
+[[ -n "$BASE" ]] || die "configured base $BASE_COMMIT is not an ancestor of patched HEAD"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/hermes-patches-rebuild.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+step "Exporting patches from $BASE_COMMIT..HEAD"
+git -C "$PATCHED_WORKTREE" format-patch --no-stat --zero-commit --output-directory "$TMP" "$BASE_COMMIT..HEAD" >/dev/null
+find "$TMP" -maxdepth 1 -type f -name '*.patch' -print | sort | sed "s#^$TMP/##" > "$TMP/series"
+[[ -s "$TMP/series" ]] || die "no downstream commits found to export"
+find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
+while IFS= read -r f; do cp "$TMP/$f" "$PATCH_DIR/$f"; done < "$TMP/series"
+cp "$TMP/series" "$PATCH_DIR/series"
+ok "rebuilt patches in $PATCH_DIR"

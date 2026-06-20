@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+VERIFY_CMD=""
+KEEP=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --verify) VERIFY_CMD="$DEFAULT_VERIFY_CMD"; shift ;;
+    --verify-cmd) VERIFY_CMD="${2:-}"; shift 2 ;;
+    --skip-verify) VERIFY_CMD=""; shift ;;
+    --keep-worktree) KEEP=1; shift ;;
+    -h|--help) echo "usage: scripts/check-patches [--verify|--verify-cmd <cmd>] [--keep-worktree]"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+ensure_upstream_cache
+step "Checking script syntax"
+bash -n "$REPO_ROOT"/scripts/{sync-upstream,apply-patches,rebuild-patches,check-patches,update-upstream,edit-patch,run-hermes} "$REPO_ROOT"/scripts/lib/common.sh
+ok "script syntax ok"
+step "Checking series file"
+TMP_SERIES="$(mktemp)"
+find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -exec basename {} \; | sort > "$TMP_SERIES"
+if ! diff -u "$TMP_SERIES" "$PATCH_DIR/series"; then
+  die "series does not match patch files"
+fi
+rm -f "$TMP_SERIES"
+ok "series matches patch files"
+CHECK_WT="$(mktemp -d "${TMPDIR:-/tmp}/hermes-patch-check.XXXXXX")"
+cleanup() {
+  if [[ "$KEEP" -eq 0 ]]; then
+    git --git-dir="$UPSTREAM_CACHE" worktree remove --force "$CHECK_WT" >/dev/null 2>&1 || rm -rf "$CHECK_WT"
+  else
+    warn "kept check worktree at $CHECK_WT"
+  fi
+}
+trap cleanup EXIT
+step "Applying patches to fresh upstream base $BASE_COMMIT"
+git --git-dir="$UPSTREAM_CACHE" worktree add --detach "$CHECK_WT" "$BASE_COMMIT" >/dev/null
+git -C "$CHECK_WT" config rerere.enabled true
+git -C "$CHECK_WT" config rerere.autoupdate true
+if apply_series_in "$CHECK_WT"; then
+  ok "patch series applies"
+else
+  warn "patch application failed; check worktree left at $CHECK_WT"
+  KEEP=1
+  exit 1
+fi
+if [[ -d "$PATCHED_WORKTREE/.git" || -f "$PATCHED_WORKTREE/.git" ]]; then
+  step "Comparing against patched worktree outside git metadata"
+  if git -C "$PATCHED_WORKTREE" diff --quiet HEAD -- . && git -C "$CHECK_WT" diff --quiet HEAD -- .; then
+    if diff -qr --exclude=.git "$CHECK_WT" "$PATCHED_WORKTREE" >/tmp/hermes-patch-tree-diff 2>&1; then
+      ok "check worktree matches patched worktree"
+    else
+      warn "tree differs from existing patched worktree (see /tmp/hermes-patch-tree-diff); continuing because patch application succeeded"
+    fi
+  else
+    warn "one worktree has uncommitted changes; skipping tree comparison"
+  fi
+fi
+if [[ -n "$VERIFY_CMD" ]]; then
+  step "Running verification command"
+  (cd "$CHECK_WT" && bash -lc "$VERIFY_CMD")
+  ok "verification passed"
+else
+  warn "no verification command set; skipping project tests"
+fi
+ok "patch check passed"

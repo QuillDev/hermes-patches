@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 13:23:59 -0700
+Subject: [PATCH 6/7] feat(api): add unified workspace session creation
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 07717f74a..72e2b0c84 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -32,6 +32,7 @@ Requires:
+ """
+ 
+ import asyncio
++import base64
+ import hashlib
+ import hmac
+ import json
+@@ -40,6 +41,7 @@ import os
+ import socket as _socket
+ import re
+ import sqlite3
++import subprocess
+ import tempfile
+ import time
+ import uuid
+@@ -121,6 +123,8 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
+ 
+ _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
+ _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
++_LOCAL_WORKSPACE_ID_PREFIX = "local:"
++_SAFE_GIT_BRANCH_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+ 
+ 
+ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
+@@ -148,6 +152,80 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
+     return default
+ 
+ 
++def _json_object(value: Any) -> Dict[str, Any]:
++    if isinstance(value, dict):
++        return dict(value)
++    if isinstance(value, str) and value.strip():
++        try:
++            parsed = json.loads(value)
++        except Exception:
++            return {}
++        return parsed if isinstance(parsed, dict) else {}
++    return {}
++
++
++def _workspace_id_for_repo(repo_path: Path) -> str:
++    raw = str(repo_path.resolve()).encode("utf-8")
++    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
++    return f"{_LOCAL_WORKSPACE_ID_PREFIX}{encoded}"
++
++
++def _repo_path_from_workspace_id(workspace_id: str) -> Optional[Path]:
++    if not isinstance(workspace_id, str) or not workspace_id.startswith(_LOCAL_WORKSPACE_ID_PREFIX):
++        return None
++    encoded = workspace_id[len(_LOCAL_WORKSPACE_ID_PREFIX):]
++    if not encoded:
++        return None
++    try:
++        padded = encoded + ("=" * (-len(encoded) % 4))
++        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
++        return Path(decoded).expanduser().resolve()
++    except Exception:
++        return None
++
++
++def _run_git(repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(
++        ["git", "-C", str(repo_path), *args],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++
++
++def _git_repo_root(repo_path: Path) -> Path:
++    result = _run_git(repo_path, "rev-parse", "--show-toplevel")
++    return Path(result.stdout.strip()).expanduser().resolve()
++
++
++def _git_default_branch(repo_path: Path) -> str:
++    probes = (
++        ("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"),
++        ("branch", "--show-current"),
++    )
++    for args in probes:
++        try:
++            value = _run_git(repo_path, *args).stdout.strip()
++        except subprocess.CalledProcessError:
++            continue
++        if value:
++            return value.removeprefix("origin/") if args[0] == "symbolic-ref" else value
++    return "HEAD"
++
++
++def _workspace_payload(repo_path: Path) -> Dict[str, Any]:
++    root = _git_repo_root(repo_path)
++    worktrees_path = root.parent / f"{root.name}-worktrees"
++    return {
++        "object": "workspace",
++        "id": _workspace_id_for_repo(root),
++        "name": root.name,
++        "repoPath": str(root),
++        "worktreesPath": str(worktrees_path),
++        "defaultBranch": _git_default_branch(root),
++    }
++
++
+ def _normalize_chat_content(
+     content: Any, *, _max_depth: int = 10, _depth: int = 0,
+ ) -> str:
+@@ -1527,6 +1605,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_chat_streaming": True,
+                 "session_run_replay": True,
+                 "session_fork": True,
++                "unified_session_create": True,
++                "workspace_resources": True,
+                 "admin_config_rw": False,
+                 "jobs_admin": False,
+                 "memory_write_api": False,
+@@ -1550,6 +1630,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                 "skills": {"method": "GET", "path": "/v1/skills"},
+                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
++                "workspaces": {"method": "POST", "path": "/v1/workspaces"},
++                "unified_session_create": {"method": "POST", "path": "/v1/sessions"},
+                 "sessions": {"method": "GET", "path": "/api/sessions"},
+                 "session_create": {"method": "POST", "path": "/api/sessions"},
+                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
+@@ -1673,10 +1755,24 @@ class APIServerAdapter(BasePlatformAdapter):
+             "end_reason", "message_count", "tool_call_count", "input_tokens",
+             "output_tokens", "cache_read_tokens", "cache_write_tokens",
+             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
+-            "api_call_count", "parent_session_id", "last_active", "preview",
++            "api_call_count", "parent_session_id", "last_active", "preview", "cwd",
+             "_lineage_root_id",
+         )
+         payload = {key: session.get(key) for key in safe_keys if key in session}
++        metadata = _json_object(session.get("model_config"))
++        worktree = metadata.get("nako_worktree") if isinstance(metadata.get("nako_worktree"), dict) else None
++        if worktree:
++            payload["type"] = "worktree"
++            payload["workspaceId"] = worktree.get("workspace_id")
++            payload["worktreeSessionId"] = session.get("id")
++            payload["worktreePath"] = worktree.get("worktree_path")
++            payload["branchName"] = worktree.get("branch_name")
++            payload["baseRef"] = worktree.get("base_ref")
++            payload["cwd"] = worktree.get("worktree_path") or payload.get("cwd")
++            payload["preview"] = payload.get("preview") or payload.get("cwd")
++        elif payload.get("cwd"):
++            payload["type"] = "chat"
++            payload["preview"] = payload.get("preview") or payload.get("cwd")
+         # Avoid exposing full system prompts/model_config through the client API;
+         # callers only need to know whether those snapshots exist.
+         payload["has_system_prompt"] = bool(session.get("system_prompt"))
+@@ -1707,6 +1803,179 @@ class APIServerAdapter(BasePlatformAdapter):
+             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+         return body, None
+ 
++    async def _handle_create_workspace(self, request: "web.Request") -> "web.Response":
++        """POST /v1/workspaces — register a local git repository for worktree sessions.
++
++        The initial API-server workspace contract is intentionally stateless: the
++        workspace id encodes the canonical local repo path, and session metadata
++        stores the actual worktree path.  This keeps the downstream Nako support
++        patch small and avoids a new workspace table/migration.
++        """
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, err = await self._read_json_body(request)
++        if err:
++            return err
++        raw_path = body.get("repo_path") or body.get("repoPath") or body.get("path")
++        if not isinstance(raw_path, str) or not raw_path.strip():
++            return web.json_response(_openai_error("repo_path is required", code="missing_repo_path"), status=400)
++        repo_path = Path(raw_path).expanduser().resolve()
++        if not repo_path.exists() or not repo_path.is_dir():
++            return web.json_response(_openai_error(f"Repository path does not exist: {repo_path}", code="repo_not_found"), status=400)
++        try:
++            workspace = await asyncio.to_thread(_workspace_payload, repo_path)
++        except subprocess.CalledProcessError as exc:
++            detail = (exc.stderr or exc.stdout or str(exc)).strip()
++            return web.json_response(_openai_error(f"Not a git repository: {detail}", code="not_git_repository"), status=400)
++        return web.json_response(workspace, status=201)
++
++    async def _handle_create_unified_session(self, request: "web.Request") -> "web.Response":
++        """POST /v1/sessions — create a chat or worktree-backed API session."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, err = await self._read_json_body(request)
++        if err:
++            return err
++        session_type = str(body.get("type") or "chat").strip().lower()
++        if session_type in {"chat", "session", "cwd"}:
++            return await self._create_unified_chat_session(body)
++        if session_type == "worktree":
++            return await self._create_unified_worktree_session(body)
++        return web.json_response(_openai_error(f"Unsupported session type: {session_type}", code="unsupported_session_type"), status=400)
++
++    async def _create_unified_chat_session(self, body: Dict[str, Any]) -> "web.Response":
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++        cwd, err = self._validated_optional_cwd(body.get("cwd"))
++        if err is not None:
++            return err
++        session_id, err = self._new_client_session_id(body)
++        if err is not None:
++            return err
++        model = body.get("model") or self._model_name
++        system_prompt = body.get("system_prompt") or body.get("systemPrompt")
++        if system_prompt is not None and not isinstance(system_prompt, str):
++            return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
++        source = self._client_session_source(body)
++        try:
++            db.create_session(session_id, source, model=str(model) if model else None, system_prompt=system_prompt, cwd=cwd)
++        except Exception as exc:
++            logger.exception("Failed to create unified chat session")
++            return web.json_response(_openai_error(f"Failed to create session: {exc}", err_type="server_error"), status=500)
++        title_err = self._apply_session_title(db, session_id, body.get("title"))
++        if title_err is not None:
++            return title_err
++        session = db.get_session(session_id) or {"id": session_id, "source": source, "model": model, "title": body.get("title"), "cwd": cwd}
++        return web.json_response(self._session_response(session), status=201)
++
++    async def _create_unified_worktree_session(self, body: Dict[str, Any]) -> "web.Response":
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++        workspace_id = body.get("workspace") or body.get("workspace_id") or body.get("workspaceId")
++        repo_path = _repo_path_from_workspace_id(str(workspace_id or ""))
++        if repo_path is None:
++            return web.json_response(_openai_error("workspace must be a valid local workspace id", code="invalid_workspace"), status=400)
++        try:
++            workspace = await asyncio.to_thread(_workspace_payload, repo_path)
++        except subprocess.CalledProcessError as exc:
++            detail = (exc.stderr or exc.stdout or str(exc)).strip()
++            return web.json_response(_openai_error(f"Workspace repository unavailable: {detail}", code="workspace_unavailable"), status=400)
++        session_id, err = self._new_client_session_id(body)
++        if err is not None:
++            return err
++        branch_name = str(body.get("branch_name") or body.get("branchName") or f"nako-{uuid.uuid4().hex[:8]}").strip()
++        if not branch_name or not _SAFE_GIT_BRANCH_RE.match(branch_name):
++            return web.json_response(_openai_error("branch_name must contain only letters, numbers, '.', '_' or '-'", code="invalid_branch_name"), status=400)
++        base_ref = str(body.get("base_ref") or body.get("baseRef") or workspace.get("defaultBranch") or "HEAD").strip()
++        worktrees_path = Path(str(workspace["worktreesPath"]))
++        worktree_path = worktrees_path / branch_name
++        if worktree_path.exists():
++            return web.json_response(_openai_error(f"Worktree path already exists: {worktree_path}", code="worktree_exists"), status=409)
++        try:
++            await asyncio.to_thread(self._create_git_worktree, Path(str(workspace["repoPath"])), worktree_path, branch_name, base_ref)
++        except subprocess.CalledProcessError as exc:
++            detail = (exc.stderr or exc.stdout or str(exc)).strip()
++            return web.json_response(_openai_error(f"Failed to create worktree: {detail}", code="worktree_create_failed"), status=400)
++        metadata = {
++            "nako_worktree": {
++                "workspace_id": workspace["id"],
++                "repo_path": workspace["repoPath"],
++                "worktree_path": str(worktree_path),
++                "branch_name": branch_name,
++                "base_ref": base_ref,
++            }
++        }
++        model = body.get("model") or self._model_name
++        system_prompt = body.get("system_prompt") or body.get("systemPrompt")
++        if system_prompt is not None and not isinstance(system_prompt, str):
++            return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
++        source = self._client_session_source(body)
++        try:
++            db.create_session(
++                session_id,
++                source,
++                model=str(model) if model else None,
++                model_config=metadata,
++                system_prompt=system_prompt,
++                cwd=str(worktree_path),
++            )
++        except Exception as exc:
++            logger.exception("Failed to create unified worktree session")
++            return web.json_response(_openai_error(f"Failed to create session: {exc}", err_type="server_error"), status=500)
++        title_err = self._apply_session_title(db, session_id, body.get("title"))
++        if title_err is not None:
++            return title_err
++        session = db.get_session(session_id) or {"id": session_id, "source": source, "model": model, "title": body.get("title"), "cwd": str(worktree_path), "model_config": metadata}
++        return web.json_response(self._session_response(session), status=201)
++
++    @staticmethod
++    def _create_git_worktree(repo_path: Path, worktree_path: Path, branch_name: str, base_ref: str) -> None:
++        worktree_path.parent.mkdir(parents=True, exist_ok=True)
++        _run_git(repo_path, "worktree", "add", "-b", branch_name, str(worktree_path), base_ref)
++
++    @staticmethod
++    def _client_session_source(body: Dict[str, Any]) -> str:
++        source = str(body.get("source") or "api_server").strip() or "api_server"
++        return "api_server" if re.search(r'[\r\n\x00]', source) else source[:64]
++
++    def _new_client_session_id(self, body: Dict[str, Any]) -> tuple[Optional[str], Optional["web.Response"]]:
++        raw_id = body.get("id") or body.get("session_id") or body.get("sessionId")
++        session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
++        if not session_id or re.search(r'[\r\n\x00]', session_id):
++            return None, web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
++        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
++            return None, web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
++        db = self._ensure_session_db()
++        if db is not None and db.get_session(session_id):
++            return None, web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
++        return session_id, None
++
++    @staticmethod
++    def _validated_optional_cwd(raw_cwd: Any) -> tuple[Optional[str], Optional["web.Response"]]:
++        if raw_cwd is None or str(raw_cwd).strip() == "":
++            return None, None
++        if not isinstance(raw_cwd, str):
++            return None, web.json_response(_openai_error("cwd must be a string", code="invalid_cwd"), status=400)
++        cwd = Path(raw_cwd).expanduser().resolve()
++        if not cwd.is_dir():
++            return None, web.json_response(_openai_error(f"cwd does not exist: {cwd}", code="invalid_cwd"), status=400)
++        return str(cwd), None
++
++    @staticmethod
++    def _apply_session_title(db: Any, session_id: str, title: Any) -> Optional["web.Response"]:
++        if title is None:
++            return None
++        try:
++            db.set_session_title(session_id, str(title))
++        except ValueError as exc:
++            db.delete_session(session_id)
++            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
++        return None
++
+     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+         db = self._ensure_session_db()
+         if db is None:
+@@ -1726,6 +1995,20 @@ class APIServerAdapter(BasePlatformAdapter):
+             logger.warning("Failed to load session history for %s: %s", session_id, exc)
+             return []
+ 
++    def _cwd_for_session(self, session_id: Optional[str]) -> str:
++        if not session_id:
++            return ""
++        db = self._ensure_session_db()
++        if db is None:
++            return ""
++        try:
++            session = db.get_session(session_id)
++        except Exception as exc:
++            logger.debug("Failed to load session cwd for %s: %s", session_id, exc)
++            return ""
++        cwd = session.get("cwd") if session else None
++        return str(cwd).strip() if cwd else ""
++
+     def _live_session_state(self, session_id: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+         payload = dict(state or {
+             "object": "hermes.session.state",
+@@ -4775,6 +5058,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 chat_id=session_id or "",
+                 session_key=gateway_session_key or session_id or "",
+                 session_id=session_id or "",
++                cwd=self._cwd_for_session(session_id),
+             )
+             try:
+                 agent = self._create_agent(
+@@ -5582,6 +5866,8 @@ class APIServerAdapter(BasePlatformAdapter):
+             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+             self._app.router.add_get("/v1/skills", self._handle_skills)
+             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
++            self._app.router.add_post("/v1/workspaces", self._handle_create_workspace)
++            self._app.router.add_post("/v1/sessions", self._handle_create_unified_session)
+             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
+             self._app.router.add_get("/v1/sessions/active", self._handle_list_active_sessions)
+             self._app.router.add_get("/v1/sessions/{session_id}/state", self._handle_session_state)
+diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
+index 31c2ef1c1..ead0031c3 100644
+--- a/tests/gateway/test_api_server.py
++++ b/tests/gateway/test_api_server.py
+@@ -16,6 +16,7 @@ import asyncio
+ import json
+ import os
+ import stat
++import subprocess
+ import time
+ import uuid
+ from unittest.mock import AsyncMock, MagicMock, patch
+@@ -494,6 +495,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
+     app.router.add_get("/v1/health", adapter._handle_health)
+     app.router.add_get("/v1/models", adapter._handle_models)
+     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
++    app.router.add_post("/v1/workspaces", adapter._handle_create_workspace)
++    app.router.add_post("/v1/sessions", adapter._handle_create_unified_session)
+     app.router.add_get("/v1/skills", adapter._handle_skills)
+     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+@@ -515,6 +518,39 @@ def auth_adapter():
+     return _make_adapter(api_key="sk-secret")
+ 
+ 
++def _init_git_repo(path):
++    path.mkdir()
++    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True)
++    (path / "README.md").write_text("hello from repo\n", encoding="utf-8")
++    subprocess.run(["git", "add", "README.md"], cwd=path, check=True, capture_output=True)
++    subprocess.run(
++        [
++            "git",
++            "-c",
++            "user.name=Hermes Test",
++            "-c",
++            "user.email=hermes@example.test",
++            "commit",
++            "-m",
++            "initial",
++        ],
++        cwd=path,
++        check=True,
++        capture_output=True,
++    )
++
++
++@pytest.fixture
++def temp_session_db(tmp_path):
++    from hermes_state import SessionDB
++
++    db = SessionDB(tmp_path / "state.db")
++    try:
++        yield db
++    finally:
++        db.close()
++
++
+ # ---------------------------------------------------------------------------
+ # Adapter internals
+ # ---------------------------------------------------------------------------
+@@ -549,6 +585,39 @@ class TestAgentExecution:
+             task_id="session-123",
+         )
+ 
++    @pytest.mark.asyncio
++    async def test_run_agent_pins_session_cwd_from_session_row(
++        self,
++        adapter,
++        tmp_path,
++        temp_session_db,
++        monkeypatch,
++    ):
++        temp_session_db.create_session("session-cwd", "api_server", cwd=str(tmp_path))
++        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: temp_session_db)
++        observed = {}
++
++        def _run_conversation(*args, **kwargs):
++            from agent.runtime_cwd import resolve_agent_cwd
++
++            observed["cwd"] = resolve_agent_cwd()
++            return {"final_response": "ok"}
++
++        mock_agent = MagicMock()
++        mock_agent.run_conversation.side_effect = _run_conversation
++        mock_agent.session_prompt_tokens = 0
++        mock_agent.session_completion_tokens = 0
++        mock_agent.session_total_tokens = 0
++
++        with patch.object(adapter, "_create_agent", return_value=mock_agent):
++            await adapter._run_agent(
++                user_message="hello",
++                conversation_history=[],
++                session_id="session-cwd",
++            )
++
++        assert observed["cwd"] == tmp_path.resolve()
++
+     @pytest.mark.asyncio
+     async def test_run_agent_threads_request_model_override_to_create_agent(self, adapter):
+         mock_agent = MagicMock()
+@@ -640,6 +709,100 @@ class TestAgentExecution:
+         assert captured["switch"]["explicit_provider"] == "openai"
+ 
+ 
++# ---------------------------------------------------------------------------
++# /v1/workspaces and unified /v1/sessions endpoint
++# ---------------------------------------------------------------------------
++
++
++class TestUnifiedSessionResources:
++    @pytest.mark.asyncio
++    async def test_create_workspace_returns_reconstructable_git_workspace(self, adapter, tmp_path):
++        repo = tmp_path / "demo-repo"
++        _init_git_repo(repo)
++        app = _create_app(adapter)
++
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post("/v1/workspaces", json={"repo_path": str(repo)})
++            assert resp.status == 201
++            data = await resp.json()
++
++        assert data["object"] == "workspace"
++        assert data["name"] == "demo-repo"
++        assert data["repoPath"] == str(repo.resolve())
++        assert data["worktreesPath"] == str(repo.parent / "demo-repo-worktrees")
++        assert data["defaultBranch"] == "main"
++        assert data["id"].startswith("local:")
++
++    @pytest.mark.asyncio
++    async def test_create_worktree_session_creates_worktree_and_projects_metadata(
++        self,
++        adapter,
++        tmp_path,
++        temp_session_db,
++        monkeypatch,
++    ):
++        repo = tmp_path / "demo-repo"
++        _init_git_repo(repo)
++        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: temp_session_db)
++        app = _create_app(adapter)
++
++        async with TestClient(TestServer(app)) as cli:
++            workspace_resp = await cli.post("/v1/workspaces", json={"repo_path": str(repo)})
++            assert workspace_resp.status == 201
++            workspace = await workspace_resp.json()
++
++            session_resp = await cli.post(
++                "/v1/sessions",
++                json={
++                    "type": "worktree",
++                    "workspace": workspace["id"],
++                    "title": "Implement the thing",
++                    "branch_name": "nako-test-branch",
++                },
++            )
++            assert session_resp.status == 201
++            session = await session_resp.json()
++
++        assert session["type"] == "worktree"
++        assert session["workspaceId"] == workspace["id"]
++        assert session["branchName"] == "nako-test-branch"
++        assert session["baseRef"] == "main"
++        assert session["title"] == "Implement the thing"
++        assert session["worktreePath"].endswith("demo-repo-worktrees/nako-test-branch")
++        assert session["cwd"] == session["worktreePath"]
++        assert (tmp_path / "demo-repo-worktrees" / "nako-test-branch" / "README.md").exists()
++
++        stored = temp_session_db.get_session(session["id"])
++        assert stored["cwd"] == session["worktreePath"]
++        metadata = json.loads(stored["model_config"])
++        assert metadata["nako_worktree"]["worktree_path"] == session["worktreePath"]
++
++    @pytest.mark.asyncio
++    async def test_create_chat_session_records_cwd_without_worktree_metadata(
++        self,
++        adapter,
++        tmp_path,
++        temp_session_db,
++        monkeypatch,
++    ):
++        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: temp_session_db)
++        app = _create_app(adapter)
++
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/v1/sessions",
++                json={"type": "chat", "title": "Repo chat", "cwd": str(tmp_path)},
++            )
++            assert resp.status == 201
++            session = await resp.json()
++
++        assert session["type"] == "chat"
++        assert session["cwd"] == str(tmp_path.resolve())
++        assert session["title"] == "Repo chat"
++        stored = temp_session_db.get_session(session["id"])
++        assert stored["cwd"] == str(tmp_path.resolve())
++
++
+ # ---------------------------------------------------------------------------
+ # /health endpoint
+ # ---------------------------------------------------------------------------
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+if [[ ! -d "$PATCHED_WORKTREE/.git" && ! -f "$PATCHED_WORKTREE/.git" ]]; then
+  "$REPO_ROOT/scripts/apply-patches"
+fi
+cd "$PATCHED_WORKTREE"
+if command -v uv >/dev/null 2>&1; then
+  uv sync --extra dev --extra messaging >/dev/null
+fi
+read -r -a RUN_PARTS <<< "$RUN_CMD"
+[[ ${#RUN_PARTS[@]} -gt 0 ]] || { echo "error: run_cmd is empty" >&2; exit 1; }
+if [[ $# -gt 0 ]]; then
+  exec "${RUN_PARTS[@]}" "$@"
+else
+  exec "${RUN_PARTS[@]}"
+fi
