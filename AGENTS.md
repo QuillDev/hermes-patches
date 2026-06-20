@@ -99,6 +99,107 @@ What `scripts/run-hermes` does:
 
 Do not run stock Hermes from `/Users/quill/.hermes/hermes-agent` when the user asks to run the patched instance from this repo.
 
+## Persistent patched Hermes gateway
+
+Use this when Quill asks whether `hermes gateway restart`, `/restart`, launchd/systemd, or a reboot/login will keep using patched Hermes.
+
+### Verified local baseline
+
+On Quill's Mac at the time this guide was written:
+
+```text
+plain hermes binary:        /Users/quill/.local/bin/hermes
+plain hermes source/env:    /Users/quill/.hermes/hermes-agent/venv/bin/python3
+patched source worktree:    /Users/quill/projects/hermes-patches/.work/hermes-patched
+macOS launchd plist:        /Users/quill/Library/LaunchAgents/ai.hermes.gateway.plist
+```
+
+Do not assume this is still true. Re-check before changing service state:
+
+```bash
+command -v hermes
+head -1 "$(command -v hermes)"
+scripts/run-hermes "--version"
+scripts/run-hermes "gateway status --full"
+```
+
+If `gateway status --full` shows `Program` or `ProgramArguments` under `/Users/quill/.hermes/hermes-agent`, the installed service is using the stock/old install, not the patched worktree.
+
+### Rule of thumb
+
+```text
+plain `hermes ...`                  = whatever ~/.local/bin/hermes points at
+scripts/run-hermes "..."            = patched Hermes from .work/hermes-patched
+launchd/systemd gateway restarts    = whatever Python/env is baked into the installed service definition
+gateway `/restart` slash command    = restarts the already-installed/current gateway; it does not switch installs by itself
+```
+
+Therefore, future agents must not say that `hermes gateway restart` uses patched Hermes unless they have verified the installed service definition points at `.work/hermes-patched` or another deliberate patched install.
+
+### Recommended persistent setup
+
+Do not symlink `/Users/quill/.hermes/hermes-agent` to the patch repo or to `.work/hermes-patched` as the default solution. That path is the normal Hermes install/source checkout and may be used by Hermes update/install tooling. Symlinking it makes rollback and upstream recovery ambiguous.
+
+Instead, install or refresh the gateway service from the patched Hermes wrapper:
+
+```bash
+cd /Users/quill/projects/hermes-patches
+
+scripts/apply-patches
+scripts/run-hermes "gateway install --force"
+scripts/run-hermes "gateway restart"
+scripts/run-hermes "gateway status --full"
+```
+
+Expected result: the launchd/systemd service definition should be regenerated from the patched environment, so future service restarts come back on patched Hermes. Verify by reading `gateway status --full`; on macOS the `Program`/`ProgramArguments` should no longer point at `/Users/quill/.hermes/hermes-agent/venv/bin/python` if the intent is to run the patch worktree.
+
+For a foreground patched gateway, use:
+
+```bash
+cd /Users/quill/projects/hermes-patches
+scripts/run-hermes "gateway run --replace"
+```
+
+### Global `hermes` command policy
+
+Do not silently change `/Users/quill/.local/bin/hermes`. If Quill explicitly wants plain `hermes` to mean patched Hermes, prefer a reversible wrapper/shim over symlinking `~/.hermes/hermes-agent`:
+
+```bash
+mv /Users/quill/.local/bin/hermes /Users/quill/.local/bin/hermes-upstream
+cat > /Users/quill/.local/bin/hermes <<'SH'
+#!/usr/bin/env bash
+exec /Users/quill/projects/hermes-patches/scripts/run-hermes "$*"
+SH
+chmod +x /Users/quill/.local/bin/hermes
+```
+
+Only do this after explicit user approval, because it globally changes every `hermes` invocation. After installing a shim, run:
+
+```bash
+hermes --version
+hermes gateway status --full
+```
+
+Rollback is:
+
+```bash
+mv /Users/quill/.local/bin/hermes-upstream /Users/quill/.local/bin/hermes
+```
+
+### Persistence checklist for future agents
+
+Before claiming the patched gateway persists restarts, collect real output for:
+
+```bash
+cd /Users/quill/projects/hermes-patches
+scripts/run-hermes "--version"
+scripts/run-hermes "gateway install --force"
+scripts/run-hermes "gateway restart"
+scripts/run-hermes "gateway status --full"
+```
+
+Then verify the service definition references the patched environment or the deliberate patched shim. If it still references `/Users/quill/.hermes/hermes-agent`, the gateway is not persistently patched.
+
 ## Add a new downstream patch
 
 Use this when implementing a new Quill/Nako Hermes change.
