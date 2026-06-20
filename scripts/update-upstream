@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+DRY=0
+YES=0
+VERIFY=0
+VERIFY_CMD=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    --yes) YES=1; shift ;;
+    --verify) VERIFY=1; shift ;;
+    --verify-cmd) VERIFY_CMD="${2:-}"; shift 2 ;;
+    -h|--help) echo "usage: scripts/update-upstream [--dry-run|--yes] [--verify|--verify-cmd <cmd>]"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+ensure_upstream_cache
+LATEST="$(current_upstream_ref)"
+step "Configured base: $BASE_COMMIT"
+step "Latest upstream/$UPSTREAM_BRANCH: $LATEST"
+if [[ "$LATEST" == "$BASE_COMMIT" ]]; then
+  ok "already at latest configured upstream base"
+fi
+CHECK_WT="$(mktemp -d "${TMPDIR:-/tmp}/hermes-patch-update.XXXXXX")"
+KEEP=0
+cleanup() {
+  if [[ "$KEEP" -eq 0 ]]; then
+    git --git-dir="$UPSTREAM_CACHE" worktree remove --force "$CHECK_WT" >/dev/null 2>&1 || rm -rf "$CHECK_WT"
+  else
+    warn "kept update worktree at $CHECK_WT"
+  fi
+}
+trap cleanup EXIT
+step "Trying patch series on latest upstream"
+git --git-dir="$UPSTREAM_CACHE" worktree add --detach "$CHECK_WT" "$LATEST" >/dev/null
+git -C "$CHECK_WT" config rerere.enabled true
+git -C "$CHECK_WT" config rerere.autoupdate true
+if apply_series_in "$CHECK_WT"; then
+  ok "patches apply to latest upstream"
+else
+  KEEP=1
+  warn "patches failed on latest upstream; resolve in $CHECK_WT"
+  warn "after repair: cd $CHECK_WT && git status && git am --continue (or git am --abort)"
+  warn "then copy/rebuild patches manually or rerun scripts/update-upstream after fixing"
+  exit 1
+fi
+if [[ "$VERIFY" -eq 1 && -z "$VERIFY_CMD" ]]; then VERIFY_CMD="$DEFAULT_VERIFY_CMD"; fi
+if [[ -n "$VERIFY_CMD" ]]; then
+  step "Running verification on updated stack"
+  (cd "$CHECK_WT" && bash -lc "$VERIFY_CMD")
+  ok "verification passed"
+fi
+if [[ "$DRY" -eq 1 ]]; then
+  ok "dry run complete; target file unchanged"
+  exit 0
+fi
+[[ "$YES" -eq 1 ]] || die "pass --yes to update targets/hermes.yaml and rebuild .work/hermes-patched"
+update_base_commit_in_target "$LATEST"
+BASE_COMMIT="$LATEST"
+step "Replacing patched worktree with updated stack"
+ensure_clean_or_remove_worktree "$PATCHED_WORKTREE"
+git --git-dir="$UPSTREAM_CACHE" worktree move "$CHECK_WT" "$PATCHED_WORKTREE"
+trap - EXIT
+ok "updated base_commit and patched worktree"
+warn "run scripts/rebuild-patches if conflicts were repaired or patch commit metadata changed"

@@ -1,0 +1,4047 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 11:21:00 -0700
+Subject: [PATCH 5/8] feat(api): durable session streams and REST API server
+ enhancements
+
+Add durable session event streaming, session run lifecycle tracking,
+and REST API enhancements for the nakov2 desktop client:
+
+Session streams (hermes_state.py):
+  - session_events table with stable item IDs and monotonic cursors
+  - session_event_consumers table for consumer offset acknowledgements
+  - append_session_event / list_session_events / acknowledge_consumer_offset
+  - session item derivation from messages (_session_items_from_message)
+  - cascade-safe event cleanup on session/message deletion
+
+Session runs (api_server.py ResponseStore):
+  - session_runs + session_run_events tables
+  - create_session_run / put_session_run_event / list_session_run_events
+  - mark_incomplete_session_runs_interrupted (startup recovery)
+
+REST API endpoints (api_server.py):
+  - GET /sessions (active sessions)
+  - GET /sessions/:id/state (live session state with tool-call status)
+  - GET /sessions/:id/items (replay-ordered session items)
+  - GET /sessions/:id/events (durable event log)
+  - GET /sessions/:id/events/firehose (SSE stream, resumes from offset)
+  - POST /sessions/:id/events/ack (consumer offset)
+  - GET/POST /sessions/:id/runs and /runs/:id/events
+  - POST /responses/:id/steer, /sessions/:id/steer, /sessions/:id/halt
+  - POST /sessions/:id/queue (queued user messages)
+  - POST /audio/transcriptions (raw audio -> STT tool)
+  - POST /responses/:id/compact (force compaction)
+  - Request-scoped model override (_resolve_request_model_override)
+
+TUI gateway (tui_gateway/server.py):
+  - Live tool-call session item events via callbacks
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 09d0dc227..07717f74a 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -40,6 +40,7 @@ import os
+ import socket as _socket
+ import re
+ import sqlite3
++import tempfile
+ import time
+ import uuid
+ from pathlib import Path
+@@ -89,9 +90,25 @@ DEFAULT_HOST = "127.0.0.1"
+ DEFAULT_PORT = 8642
+ MAX_STORED_RESPONSES = 100
+ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
++MAX_AUDIO_TRANSCRIPTION_BYTES = 25 * 1024 * 1024
+ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
+ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
++_AUDIO_MIME_EXTENSIONS = {
++    "audio/aac": ".aac",
++    "audio/flac": ".flac",
++    "audio/m4a": ".m4a",
++    "audio/mp3": ".mp3",
++    "audio/mp4": ".mp4",
++    "audio/mpeg": ".mp3",
++    "audio/mpga": ".mpga",
++    "audio/ogg": ".ogg",
++    "audio/wav": ".wav",
++    "audio/webm": ".webm",
++    "audio/x-m4a": ".m4a",
++    "audio/x-wav": ".wav",
++    "video/webm": ".webm",
++}
+ 
+ 
+ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
+@@ -363,6 +380,29 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message")
+         return None, _multimodal_validation_error(exc, param=param)
+ 
+ 
++def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Optional["web.Response"]]:
++    """Parse a queued message from chat-stream or Responses-style request bodies."""
++    user_message, err = _session_chat_user_message(body)
++    if err is None:
++        return user_message, None
++    raw_input = body.get("input")
++    if isinstance(raw_input, list):
++        for item in reversed(raw_input):
++            if not isinstance(item, dict):
++                continue
++            role = str(item.get("role") or "user")
++            if role != "user":
++                continue
++            content = item.get("content")
++            if not _content_has_visible_payload(content):
++                continue
++            try:
++                return _normalize_multimodal_content(content), None
++            except ValueError as exc:
++                return None, _multimodal_validation_error(exc, param="input")
++    return None, err
++
++
+ def check_api_server_requirements() -> bool:
+     """Check if API server dependencies are available."""
+     return AIOHTTP_AVAILABLE
+@@ -413,7 +453,34 @@ class ResponseStore:
+                 response_id TEXT NOT NULL
+             )"""
+         )
++        self._conn.execute(
++            """CREATE TABLE IF NOT EXISTS session_runs (
++                run_id TEXT PRIMARY KEY,
++                session_id TEXT NOT NULL,
++                status TEXT NOT NULL,
++                user_message TEXT,
++                error TEXT,
++                created_at REAL NOT NULL,
++                updated_at REAL NOT NULL,
++                last_seq INTEGER NOT NULL DEFAULT 0
++            )"""
++        )
++        self._conn.execute(
++            """CREATE INDEX IF NOT EXISTS idx_session_runs_session_updated
++               ON session_runs(session_id, updated_at DESC)"""
++        )
++        self._conn.execute(
++            """CREATE TABLE IF NOT EXISTS session_run_events (
++                run_id TEXT NOT NULL,
++                seq INTEGER NOT NULL,
++                event_name TEXT NOT NULL,
++                payload TEXT NOT NULL,
++                created_at REAL NOT NULL,
++                PRIMARY KEY(run_id, seq)
++            )"""
++        )
+         self._conn.commit()
++        self.mark_incomplete_session_runs_interrupted()
+         # response_store.db contains conversation history (tool payloads,
+         # prompts, results). Tighten to owner-only after creation so other
+         # local users on a shared box can't read it. Run once at __init__
+@@ -524,6 +591,152 @@ class ResponseStore:
+         )
+         self._conn.commit()
+ 
++    def create_session_run(self, run_id: str, session_id: str, user_message: Any) -> None:
++        """Persist a session chat-stream run so clients can recover/replay it."""
++        now = time.time()
++        try:
++            encoded_user_message = json.dumps(user_message, default=str)
++        except (TypeError, ValueError):
++            encoded_user_message = json.dumps(str(user_message))
++        self._conn.execute(
++            """INSERT OR REPLACE INTO session_runs
++               (run_id, session_id, status, user_message, error, created_at, updated_at, last_seq)
++               VALUES (?, ?, 'queued', ?, NULL, ?, ?, 0)""",
++            (run_id, session_id, encoded_user_message, now, now),
++        )
++        self._conn.commit()
++
++    def put_session_run_event(self, run_id: str, event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
++        """Append a replayable event and update the run snapshot."""
++        now = time.time()
++        row = self._conn.execute(
++            "SELECT session_id, last_seq FROM session_runs WHERE run_id = ?",
++            (run_id,),
++        ).fetchone()
++        if row is None:
++            return payload
++
++        seq = int(row[1] or 0) + 1
++        stored_payload = dict(payload)
++        stored_payload.setdefault("run_id", run_id)
++        stored_payload.setdefault("session_id", row[0])
++        stored_payload["seq"] = seq
++        stored_payload.setdefault("ts", now)
++
++        status = None
++        error = None
++        if event_name == "run.started":
++            status = "running"
++        elif event_name == "run.completed":
++            status = "completed"
++        elif event_name == "error":
++            status = "failed"
++            error = str(stored_payload.get("message") or "stream failed")
++
++        self._conn.execute(
++            """INSERT OR REPLACE INTO session_run_events
++               (run_id, seq, event_name, payload, created_at)
++               VALUES (?, ?, ?, ?, ?)""",
++            (run_id, seq, event_name, json.dumps(stored_payload, default=str), now),
++        )
++        if status is None:
++            self._conn.execute(
++                "UPDATE session_runs SET updated_at = ?, last_seq = ? WHERE run_id = ?",
++                (now, seq, run_id),
++            )
++        else:
++            self._conn.execute(
++                """UPDATE session_runs
++                   SET status = ?, error = COALESCE(?, error), updated_at = ?, last_seq = ?
++                   WHERE run_id = ?""",
++                (status, error, now, seq, run_id),
++            )
++        self._conn.commit()
++        return stored_payload
++
++    def mark_incomplete_session_runs_interrupted(self) -> int:
++        """Mark runs left in-flight by a previous API-server process as interrupted."""
++        now = time.time()
++        cur = self._conn.execute(
++            """UPDATE session_runs
++               SET status = 'interrupted',
++                   error = COALESCE(error, 'Hermes API server restarted while this run was active.'),
++                   updated_at = ?
++               WHERE status IN ('queued', 'running')""",
++            (now,),
++        )
++        self._conn.commit()
++        return int(cur.rowcount or 0)
++
++    def get_latest_session_run(self, session_id: str) -> Optional[Dict[str, Any]]:
++        row = self._conn.execute(
++            """SELECT run_id, session_id, status, user_message, error, created_at, updated_at, last_seq
++               FROM session_runs WHERE session_id = ?
++               ORDER BY updated_at DESC LIMIT 1""",
++            (session_id,),
++        ).fetchone()
++        return self._session_run_row_to_dict(row) if row is not None else None
++
++    def get_session_run(self, run_id: str) -> Optional[Dict[str, Any]]:
++        row = self._conn.execute(
++            """SELECT run_id, session_id, status, user_message, error, created_at, updated_at, last_seq
++               FROM session_runs WHERE run_id = ?""",
++            (run_id,),
++        ).fetchone()
++        return self._session_run_row_to_dict(row) if row is not None else None
++
++    def list_session_run_events(self, run_id: str, after: int = 0) -> List[Dict[str, Any]]:
++        rows = self._conn.execute(
++            """SELECT event_name, payload FROM session_run_events
++               WHERE run_id = ? AND seq > ? ORDER BY seq ASC""",
++            (run_id, int(after or 0)),
++        ).fetchall()
++        events: List[Dict[str, Any]] = []
++        for event_name, payload_text in rows:
++            try:
++                payload = json.loads(payload_text)
++            except (json.JSONDecodeError, TypeError):
++                payload = {}
++            events.append({"event": event_name, "payload": payload})
++        return events
++
++    def _session_run_row_to_dict(self, row: Any) -> Dict[str, Any]:
++        run = {
++            "object": "hermes.session.run",
++            "run_id": row[0],
++            "session_id": row[1],
++            "status": row[2],
++            "error": row[4],
++            "created_at": row[5],
++            "updated_at": row[6],
++            "last_seq": int(row[7] or 0),
++        }
++        try:
++            run["user_message"] = json.loads(row[3]) if row[3] else None
++        except (json.JSONDecodeError, TypeError):
++            run["user_message"] = row[3]
++
++        draft: List[str] = []
++        reasoning: List[str] = []
++        tool_status = None
++        for item in self.list_session_run_events(row[0], after=0):
++            name = item.get("event")
++            payload = item.get("payload") or {}
++            if name == "assistant.delta":
++                draft.append(str(payload.get("delta") or ""))
++                tool_status = None
++            elif name == "tool.progress":
++                reasoning.append(str(payload.get("delta") or ""))
++                tool_status = "thinking…"
++            elif name == "tool.started":
++                tool_status = f"{payload.get('tool_name') or 'tool'}…"
++            elif name in {"tool.completed", "tool.failed"}:
++                tool_status = None
++        run["draft"] = "".join(draft)
++        run["reasoning"] = "".join(reasoning)
++        run["tool_status"] = tool_status
++        return run
++
+     def close(self) -> None:
+         """Close the database connection."""
+         try:
+@@ -591,7 +804,12 @@ if AIOHTTP_AVAILABLE:
+             cl = request.headers.get("Content-Length")
+             if cl is not None:
+                 try:
+-                    if int(cl) > MAX_REQUEST_BYTES:
++                    limit = (
++                        MAX_AUDIO_TRANSCRIPTION_BYTES
++                        if request.path == "/v1/audio/transcriptions"
++                        else MAX_REQUEST_BYTES
++                    )
++                    if int(cl) > limit:
+                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
+                 except ValueError:
+                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
+@@ -775,6 +993,11 @@ class APIServerAdapter(BasePlatformAdapter):
+         # Active run agent/task references for stop support
+         self._active_run_agents: Dict[str, Any] = {}
+         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
++        # Active Responses API agents for mid-run /steer support. Values are
++        # one-element agent_ref lists populated by _run_agent before the loop starts.
++        self._active_response_agents: Dict[str, list] = {}
++        self._active_response_agents_by_session: Dict[str, list] = {}
++        self._session_chat_pending_messages: Dict[str, List[Dict[str, Any]]] = {}
+         # Pollable run status for dashboards and external control-plane UIs.
+         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+         # Active approval session key for each run_id.  The approval core
+@@ -920,6 +1143,9 @@ class APIServerAdapter(BasePlatformAdapter):
+             token = auth_header[7:].strip()
+             if hmac.compare_digest(token, self._api_key):
+                 return None  # Auth OK
++        query_token = request.query.get("access_token") or request.query.get("api_key")
++        if query_token and hmac.compare_digest(str(query_token), self._api_key):
++            return None  # Auth OK
+ 
+         logger.warning(
+             "API server rejected invalid API key: %s",
+@@ -1026,6 +1252,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         tool_start_callback=None,
+         tool_complete_callback=None,
+         gateway_session_key: Optional[str] = None,
++        request_model_override: Optional[Dict[str, Any]] = None,
+     ) -> Any:
+         """
+         Create an AIAgent instance using the gateway's runtime config.
+@@ -1052,9 +1279,22 @@ class APIServerAdapter(BasePlatformAdapter):
+         )
+         from hermes_cli.tools_config import _get_platform_tools
+ 
+-        runtime_kwargs = _resolve_runtime_agent_kwargs()
++        try:
++            runtime_kwargs = _resolve_runtime_agent_kwargs()
++        except Exception:
++            if not request_model_override:
++                raise
++            runtime_kwargs = {}
+         reasoning_config = GatewayRunner._load_reasoning_config()
+         model = _resolve_gateway_model()
++        if request_model_override:
++            model = request_model_override.get("model") or model
++            override_runtime = request_model_override.get("runtime") or {}
++            for key in ("provider", "api_key", "base_url", "api_mode", "command", "credential_pool"):
++                if key in override_runtime:
++                    runtime_kwargs[key] = override_runtime.get(key)
++            if "args" in override_runtime:
++                runtime_kwargs["args"] = list(override_runtime.get("args") or [])
+ 
+         user_config = _load_gateway_config()
+         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+@@ -1086,6 +1326,108 @@ class APIServerAdapter(BasePlatformAdapter):
+         )
+         return agent
+ 
++    def _resolve_request_model_override(
++        self,
++        body: Dict[str, Any],
++    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
++        """Resolve request-scoped provider/model selection.
++
++        OpenAI-compatible clients already send ``model`` as a frontend routing
++        or display identifier, so Hermes only treats it as a backend selection
++        when the request also supplies a Hermes ``provider`` field.
++        """
++        requested_provider = body.get("provider")
++        if requested_provider is None:
++            hermes_ext = body.get("hermes")
++            if isinstance(hermes_ext, dict):
++                requested_provider = hermes_ext.get("provider")
++
++        if requested_provider is None or str(requested_provider).strip() == "":
++            return None, None
++        if not isinstance(requested_provider, str):
++            return None, web.json_response(
++                _openai_error("'provider' must be a string", param="provider"),
++                status=400,
++            )
++
++        requested_model = body.get("model")
++        if not isinstance(requested_model, str) or not requested_model.strip():
++            return None, web.json_response(
++                _openai_error("'model' is required when 'provider' is supplied", param="model"),
++                status=400,
++            )
++
++        try:
++            from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
++            from hermes_cli.config import get_compatible_custom_providers
++            from hermes_cli.model_switch import switch_model
++            from hermes_cli.runtime_provider import resolve_runtime_provider
++
++            user_config = _load_gateway_config()
++            try:
++                runtime_kwargs = _resolve_runtime_agent_kwargs()
++            except Exception as exc:
++                logger.debug(
++                    "Configured gateway runtime unavailable while resolving request override: %s",
++                    exc,
++                )
++                runtime_kwargs = {}
++            current_model = _resolve_gateway_model(user_config)
++            runtime_model = runtime_kwargs.get("model")
++            if runtime_model:
++                current_model = runtime_model
++
++            provider = requested_provider.strip()
++            model = requested_model.strip()
++            switch_result = switch_model(
++                raw_input=model,
++                current_provider=runtime_kwargs.get("provider") or "",
++                current_model=current_model or "",
++                current_base_url=runtime_kwargs.get("base_url") or "",
++                current_api_key=runtime_kwargs.get("api_key") or "",
++                explicit_provider=provider,
++                user_providers=user_config.get("providers") if isinstance(user_config, dict) else None,
++                custom_providers=get_compatible_custom_providers(user_config),
++            )
++            if not switch_result.success:
++                return None, web.json_response(
++                    _openai_error(
++                        switch_result.error_message or "Invalid provider/model selection",
++                        param="model",
++                    ),
++                    status=400,
++                )
++
++            resolved_runtime = resolve_runtime_provider(
++                requested=switch_result.target_provider,
++                target_model=switch_result.new_model,
++            )
++            override_runtime = {
++                "provider": switch_result.target_provider,
++                "api_key": switch_result.api_key or resolved_runtime.get("api_key"),
++                "base_url": switch_result.base_url or resolved_runtime.get("base_url"),
++                "api_mode": switch_result.api_mode or resolved_runtime.get("api_mode"),
++                "command": resolved_runtime.get("command"),
++                "args": list(resolved_runtime.get("args") or []),
++                "credential_pool": resolved_runtime.get("credential_pool"),
++            }
++            return {
++                "model": switch_result.new_model,
++                "provider": switch_result.target_provider,
++                "runtime": override_runtime,
++            }, None
++        except Exception as exc:
++            logger.warning(
++                "Failed to resolve request model override provider=%r model=%r: %s",
++                requested_provider,
++                requested_model,
++                exc,
++            )
++            return None, web.json_response(
++                _openai_error(f"Could not resolve provider/model selection: {exc}", param="provider"),
++                status=400,
++            )
++
+     # ------------------------------------------------------------------
+     # HTTP Handlers
+     # ------------------------------------------------------------------
+@@ -1183,6 +1525,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_resources": True,
+                 "session_chat": True,
+                 "session_chat_streaming": True,
++                "session_run_replay": True,
+                 "session_fork": True,
+                 "admin_config_rw": False,
+                 "jobs_admin": False,
+@@ -1216,6 +1559,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
++                "session_active_run": {"method": "GET", "path": "/api/sessions/{session_id}/active-run"},
++                "session_run_events": {"method": "GET", "path": "/api/session-runs/{run_id}/events"},
+             },
+         })
+ 
+@@ -1345,7 +1690,13 @@ class APIServerAdapter(BasePlatformAdapter):
+             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
+             "reasoning_content",
+         )
+-        return {key: message.get(key) for key in safe_keys if key in message}
++        payload = {key: message.get(key) for key in safe_keys if key in message}
++        try:
++            from hermes_state import SessionDB
++            payload["items"] = SessionDB._session_items_from_message(message)
++        except Exception:
++            payload["items"] = []
++        return payload
+ 
+     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
+         try:
+@@ -1375,6 +1726,294 @@ class APIServerAdapter(BasePlatformAdapter):
+             logger.warning("Failed to load session history for %s: %s", session_id, exc)
+             return []
+ 
++    def _live_session_state(self, session_id: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++        payload = dict(state or {
++            "object": "hermes.session.state",
++            "session_id": session_id,
++            "state": "idle",
++            "status": "idle",
++            "active": False,
++        })
++        active_run = any(
++            run.get("session_id") == session_id
++            and run.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
++            for run in self._run_statuses.values()
++        )
++        if session_id in self._active_response_agents_by_session or active_run:
++            payload["state"] = "processing"
++            payload["status"] = "processing"
++            payload["active"] = True
++        return payload
++
++    def _record_response_session_event(
++        self,
++        *,
++        session_id: Optional[str],
++        event_type: str,
++        response_id: str,
++        response: Dict[str, Any],
++    ) -> None:
++        if not session_id:
++            return
++        db = self._ensure_session_db()
++        if db is None:
++            return
++        try:
++            db.append_session_event(
++                session_id,
++                event_type,
++                {
++                    "session_id": session_id,
++                    "response_id": response_id,
++                    "response": response,
++                },
++                item_id=f"response:{response_id}",
++                response_id=response_id,
++            )
++        except Exception as exc:
++            logger.debug("Failed to record response session event for %s: %s", session_id, exc)
++
++    def _record_run_session_event(
++        self,
++        *,
++        session_id: Optional[str],
++        event_type: str,
++        run_id: str,
++        payload: Dict[str, Any],
++    ) -> None:
++        if not session_id:
++            return
++        db = self._ensure_session_db()
++        if db is None:
++            return
++        try:
++            db.ensure_session(session_id, source="api_server", model=payload.get("model"))
++            event_payload = dict(payload)
++            event_payload["session_id"] = session_id
++            event_payload["run_id"] = run_id
++            db.append_session_event(
++                session_id,
++                event_type,
++                event_payload,
++                item_id=f"run:{run_id}",
++            )
++        except Exception as exc:
++            logger.debug("Failed to record run session event for %s: %s", session_id, exc)
++
++    def _record_live_tool_session_item(
++        self,
++        *,
++        session_id: Optional[str],
++        item_type: str,
++        tool_call_id: Optional[str],
++        name: Optional[str],
++        arguments: Any,
++        content: Optional[str] = None,
++        response_id: Optional[str] = None,
++    ) -> None:
++        """Publish provisional tool items to the durable session event stream."""
++        if not session_id or not tool_call_id:
++            return
++        db = self._ensure_session_db()
++        if db is None:
++            return
++        now = time.time()
++        item: Dict[str, Any] = {
++            "id": f"live:{item_type}:{tool_call_id}",
++            "object": "hermes.session.item",
++            "type": item_type,
++            "session_id": session_id,
++            "created_at": now,
++            "committed_at": None,
++            "tool_call_id": tool_call_id,
++            "tool_name": name or "tool",
++        }
++        if response_id:
++            item["response_id"] = response_id
++        if item_type == "tool_call":
++            item["role"] = "assistant"
++            try:
++                item["tool_arguments"] = json.dumps(arguments or {}, sort_keys=True, default=str)
++            except Exception:
++                item["tool_arguments"] = "{}"
++        elif item_type == "tool_result":
++            item["role"] = "tool"
++            item["content"] = content or ""
++        else:
++            return
++        try:
++            db.ensure_session(session_id, source="api_server")
++            db.append_session_event(
++                session_id,
++                "session.item.upserted",
++                {"item": item},
++                item_id=str(item["id"]),
++                response_id=response_id,
++            )
++        except Exception as exc:
++            logger.debug("Failed to record live tool session item for %s: %s", session_id, exc)
++
++    async def _handle_list_active_sessions(self, request: "web.Request") -> "web.Response":
++        """GET /v1/sessions/active — sessions Nako should reconcile on startup."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++        limit = self._parse_nonnegative_int(request.query.get("limit"), default=200, maximum=1000)
++        recent_seconds = self._parse_nonnegative_int(
++            request.query.get("recent_seconds"),
++            default=14 * 24 * 60 * 60,
++            maximum=90 * 24 * 60 * 60,
++        )
++        sessions = db.list_sync_sessions(limit=limit, recent_seconds=recent_seconds)
++        data = []
++        for session in sessions:
++            payload = self._session_response(session)
++            sync_state = session.get("sync_state")
++            payload["sync_state"] = self._live_session_state(session["id"], sync_state)
++            payload["latest_event_cursor"] = session.get("latest_event_cursor")
++            data.append(payload)
++        return web.json_response({"object": "list", "data": data, "limit": limit})
++
++    async def _handle_session_state(self, request: "web.Request") -> "web.Response":
++        """GET /v1/sessions/{session_id}/state."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        _, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        db = self._ensure_session_db()
++        return web.json_response(self._live_session_state(session_id, db.get_session_sync_state(session_id)))
++
++    async def _handle_session_items(self, request: "web.Request") -> "web.Response":
++        """GET /v1/sessions/{session_id}/items — full stable item projection."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        _, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        db = self._ensure_session_db()
++        items = db.get_session_items(session_id)
++        return web.json_response({
++            "object": "list",
++            "session_id": session_id,
++            "data": items,
++            "latest_event_cursor": db.latest_session_event_cursor(session_id),
++        })
++
++    async def _handle_session_events(self, request: "web.Request") -> "web.Response":
++        """GET /v1/sessions/{session_id}/events — replay durable events after a cursor."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        _, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        db = self._ensure_session_db()
++        limit = self._parse_nonnegative_int(request.query.get("limit"), default=100, maximum=1000)
++        events = db.list_session_events(
++            session_id=session_id,
++            after=request.query.get("after") or request.query.get("cursor"),
++            limit=limit,
++        )
++        return web.json_response({
++            "object": "list",
++            "session_id": session_id,
++            "data": events,
++            "latest_event_cursor": db.latest_session_event_cursor(session_id),
++            "has_more": len(events) == limit,
++        })
++
++    async def _handle_session_firehose(self, request: "web.Request") -> "web.StreamResponse":
++        """GET /v1/session_events/firehose — websocket stream of durable session events."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++
++        ws = web.WebSocketResponse(heartbeat=30.0)
++        await ws.prepare(request)
++
++        session_id = request.query.get("session_id") or None
++        consumer = request.query.get("consumer") or None
++        cursor = request.query.get("after") or request.query.get("cursor")
++        # When the client does not pin an explicit resume point, fall back to
++        # this consumer's durably-acknowledged offset so a reconnecting consumer
++        # never re-streams events it already stored (nor misses the gap). An
++        # explicit `after` always wins — the client may know a newer watermark.
++        if cursor is None and consumer:
++            cursor = db.get_consumer_offset(consumer)
++        idle_sleep_seconds = 0.5
++        try:
++            while not ws.closed:
++                events = db.list_session_events(session_id=session_id, after=cursor, limit=100)
++                if events:
++                    for event in events:
++                        await ws.send_json(event)
++                        cursor = event["cursor"]
++                    continue
++                try:
++                    message = await ws.receive(timeout=idle_sleep_seconds)
++                except asyncio.TimeoutError:
++                    continue
++                if message.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
++                    break
++                if message.type == web.WSMsgType.TEXT:
++                    try:
++                        payload = json.loads(message.data)
++                    except Exception:
++                        continue
++                    if isinstance(payload, dict) and payload.get("after") is not None:
++                        cursor = str(payload["after"])
++        except Exception as exc:
++            logger.debug("[api_server] session firehose closed: %s", exc)
++        finally:
++            await ws.close()
++        return ws
++
++    async def _handle_session_events_ack(self, request: "web.Request") -> "web.Response":
++        """POST /v1/session_events/ack — durably record a consumer's firehose offset.
++
++        Body: ``{"consumer": "nako", "cursor": "<watermark>"}``. The cursor is an
++        inclusive watermark: it asserts every event ``<= cursor`` has been
++        persisted by ``consumer``. Idempotent and monotonic on the store side, so
++        retries and replays are safe. Consumers MUST call this only after their
++        own write commits.
++        """
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++        try:
++            body = await request.json()
++        except Exception:
++            body = None
++        if not isinstance(body, dict):
++            return web.json_response(_openai_error("Request body must be a JSON object", code="invalid_request"), status=400)
++        consumer = body.get("consumer")
++        cursor = body.get("cursor")
++        if not consumer or not isinstance(consumer, str):
++            return web.json_response(_openai_error("consumer is required", code="invalid_request"), status=400)
++        if cursor is None:
++            return web.json_response(_openai_error("cursor is required", code="invalid_request"), status=400)
++        offset = db.acknowledge_consumer_offset(consumer, cursor)
++        return web.json_response({
++            "object": "hermes.session_events.ack",
++            "consumer": consumer,
++            "cursor": offset,
++        })
++
+     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+         """GET /api/sessions — list persisted Hermes sessions."""
+         auth_err = self._check_auth(request)
+@@ -1557,6 +2196,62 @@ class APIServerAdapter(BasePlatformAdapter):
+         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
+         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+ 
++    async def _handle_session_active_run(self, request: "web.Request") -> "web.Response":
++        """GET /api/sessions/{session_id}/active-run — latest durable stream state."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        _, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        run = self._response_store.get_latest_session_run(session_id)
++        return web.json_response({"object": "hermes.session.run", "run": run})
++
++    async def _handle_session_run_events(self, request: "web.Request") -> "web.StreamResponse":
++        """GET /api/session-runs/{run_id}/events — replayable SSE stream."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        run_id = request.match_info["run_id"]
++        try:
++            after = int(request.query.get("after", "0") or "0")
++        except ValueError:
++            return web.json_response(_openai_error("after must be an integer", code="invalid_after"), status=400)
++        run = self._response_store.get_session_run(run_id)
++        if run is None:
++            return web.json_response(_openai_error(f"Session run not found: {run_id}", code="run_not_found"), status=404)
++
++        response = web.StreamResponse(
++            status=200,
++            headers={
++                "Content-Type": "text/event-stream",
++                "Cache-Control": "no-cache",
++                "X-Accel-Buffering": "no",
++            },
++        )
++        await response.prepare(request)
++        try:
++            while True:
++                wrote = False
++                for item in self._response_store.list_session_run_events(run_id, after=after):
++                    payload = item["payload"]
++                    after = max(after, int(payload.get("seq") or after))
++                    data = json.dumps(payload, ensure_ascii=False)
++                    await response.write(f"event: {item['event']}\ndata: {data}\n\n".encode("utf-8"))
++                    wrote = True
++                run = self._response_store.get_session_run(run_id)
++                if not run or run.get("status") not in {"queued", "running"}:
++                    break
++                if not wrote:
++                    await response.write(b": keepalive\n\n")
++                await asyncio.sleep(0.5)
++        except (asyncio.CancelledError, ConnectionResetError):
++            raise
++        except Exception as exc:
++            logger.debug("[api_server] session run replay stream error for %s: %s", run_id, exc)
++        return response
++
+     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
+         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+         auth_err = self._check_auth(request)
+@@ -1578,6 +2273,9 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        request_model_override, model_override_err = self._resolve_request_model_override(body)
++        if model_override_err is not None:
++            return model_override_err
+         history = self._conversation_history_for_session(session_id)
+         result, usage = await self._run_agent(
+             user_message=user_message,
+@@ -1585,6 +2283,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             ephemeral_system_prompt=system_prompt,
+             session_id=session_id,
+             gateway_session_key=gateway_session_key,
++            request_model_override=request_model_override,
+         )
+         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+@@ -1622,20 +2321,25 @@ class APIServerAdapter(BasePlatformAdapter):
+         system_prompt = body.get("system_message") or body.get("instructions")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        request_model_override, model_override_err = self._resolve_request_model_override(body)
++        if model_override_err is not None:
++            return model_override_err
+ 
+         loop = asyncio.get_running_loop()
+         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
+         message_id = f"msg_{uuid.uuid4().hex}"
+         run_id = f"run_{uuid.uuid4().hex}"
+-        seq = 0
++        agent_ref = [None]
++        self._response_store.create_session_run(run_id, session_id, user_message)
+ 
+         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+-            nonlocal seq
+-            seq += 1
+             payload.setdefault("session_id", session_id)
+             payload.setdefault("run_id", run_id)
+-            payload.setdefault("seq", seq)
+             payload.setdefault("ts", time.time())
++            try:
++                payload = self._response_store.put_session_run_event(run_id, name, payload)
++            except Exception:
++                logger.debug("[api_server] failed to persist session run event", exc_info=True)
+             return name, payload
+ 
+         def _enqueue(name: str, payload: Dict[str, Any]) -> None:
+@@ -1663,45 +2367,104 @@ class APIServerAdapter(BasePlatformAdapter):
+                 event_name = event_type.replace("tool.", "tool.")
+                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+ 
++        def _on_tool_start(tool_call_id, function_name, function_args):
++            self._record_live_tool_session_item(
++                session_id=session_id,
++                item_type="tool_call",
++                tool_call_id=tool_call_id,
++                name=function_name,
++                arguments=function_args or {},
++                response_id=run_id,
++            )
++
++        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
++            self._record_live_tool_session_item(
++                session_id=session_id,
++                item_type="tool_result",
++                tool_call_id=tool_call_id,
++                name=function_name,
++                arguments=function_args or {},
++                content=function_result,
++                response_id=run_id,
++            )
++
++        async def _run_turn(
++            turn_user_message: Any,
++            turn_system_prompt: Optional[str],
++            turn_request_model_override: Optional[Dict[str, Any]],
++            turn_gateway_session_key: Optional[str],
++        ) -> None:
++            await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": turn_user_message}}))
++            await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
++            history = self._conversation_history_for_session(session_id)
++            result, usage = await self._run_agent(
++                user_message=turn_user_message,
++                conversation_history=history,
++                ephemeral_system_prompt=turn_system_prompt,
++                session_id=session_id,
++                stream_delta_callback=_delta,
++                tool_progress_callback=_tool_progress,
++                tool_start_callback=_on_tool_start,
++                tool_complete_callback=_on_tool_complete,
++                agent_ref=agent_ref,
++                gateway_session_key=turn_gateway_session_key,
++                request_model_override=turn_request_model_override,
++            )
++            final_response = result.get("final_response", "") if isinstance(result, dict) else ""
++            effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
++            turn_messages = self._turn_transcript_messages(history, turn_user_message, result) if isinstance(result, dict) else []
++            await queue.put(_event_payload("assistant.completed", {
++                "session_id": effective_session_id,
++                "message_id": message_id,
++                "content": final_response,
++                "completed": True,
++                "partial": False,
++                "interrupted": False,
++            }))
++            await queue.put(_event_payload("run.completed", {
++                "session_id": effective_session_id,
++                "message_id": message_id,
++                "completed": True,
++                "messages": turn_messages,
++                "usage": usage,
++            }))
++
+         async def _run_and_signal() -> None:
++            nonlocal message_id, run_id
+             try:
+-                await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+-                await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+-                history = self._conversation_history_for_session(session_id)
+-                result, usage = await self._run_agent(
+-                    user_message=user_message,
+-                    conversation_history=history,
+-                    ephemeral_system_prompt=system_prompt,
+-                    session_id=session_id,
+-                    stream_delta_callback=_delta,
+-                    tool_progress_callback=_tool_progress,
+-                    gateway_session_key=gateway_session_key,
++                await _run_turn(
++                    user_message,
++                    system_prompt,
++                    request_model_override,
++                    gateway_session_key,
+                 )
+-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+-                effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+-                await queue.put(_event_payload("assistant.completed", {
+-                    "session_id": effective_session_id,
+-                    "message_id": message_id,
+-                    "content": final_response,
+-                    "completed": True,
+-                    "partial": False,
+-                    "interrupted": False,
+-                }))
+-                await queue.put(_event_payload("run.completed", {
+-                    "session_id": effective_session_id,
+-                    "message_id": message_id,
+-                    "completed": True,
+-                    "messages": turn_messages,
+-                    "usage": usage,
+-                }))
++                while True:
++                    pending = self._session_chat_pending_messages.get(session_id) or []
++                    if not pending:
++                        self._session_chat_pending_messages.pop(session_id, None)
++                        break
++                    queued = pending.pop(0)
++                    if not pending:
++                        self._session_chat_pending_messages.pop(session_id, None)
++                    run_id = str(queued.get("run_id") or f"run_{uuid.uuid4().hex}")
++                    message_id = f"msg_{uuid.uuid4().hex}"
++                    self._response_store.create_session_run(run_id, session_id, queued.get("user_message"))
++                    await _run_turn(
++                        queued.get("user_message"),
++                        queued.get("system_prompt"),
++                        queued.get("request_model_override"),
++                        queued.get("gateway_session_key") or gateway_session_key,
++                    )
+             except Exception as exc:
+                 logger.exception("[api_server] session chat stream failed")
+                 await queue.put(_event_payload("error", {"message": str(exc)}))
+             finally:
+                 await queue.put(_event_payload("done", {}))
+                 await queue.put(None)
++                if self._active_response_agents_by_session.get(session_id) is agent_ref:
++                    self._active_response_agents_by_session.pop(session_id, None)
+ 
++        self._active_response_agents_by_session[session_id] = agent_ref
+         task = asyncio.create_task(_run_and_signal())
+         try:
+             self._background_tasks.add(task)
+@@ -1735,9 +2498,11 @@ class APIServerAdapter(BasePlatformAdapter):
+                 data = json.dumps(payload, ensure_ascii=False)
+                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
+                 last_write = time.monotonic()
+-        except (asyncio.CancelledError, ConnectionResetError):
++        except asyncio.CancelledError:
+             task.cancel()
+             raise
++        except ConnectionResetError as exc:
++            logger.debug("[api_server] session SSE client disconnected: %s", exc)
+         except Exception as exc:
+             logger.debug("[api_server] session SSE stream error: %s", exc)
+         return response
+@@ -1761,6 +2526,16 @@ class APIServerAdapter(BasePlatformAdapter):
+                 status=400,
+             )
+ 
++        request_model_override, model_override_err = self._resolve_request_model_override(body)
++        if model_override_err is not None:
++            return model_override_err
++        response_model_name = (
++            request_model_override.get("model")
++            if request_model_override
++            else body.get("model", self._model_name)
++        )
++        response_provider_name = request_model_override.get("provider") if request_model_override else None
++
+         stream = _coerce_request_bool(body.get("stream"), default=False)
+ 
+         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+@@ -1857,7 +2632,6 @@ class APIServerAdapter(BasePlatformAdapter):
+             # history already set from request body above
+ 
+         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+-        model_name = body.get("model", self._model_name)
+         created = int(time.time())
+ 
+         if stream:
+@@ -1942,13 +2716,14 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                request_model_override=request_model_override,
+             ))
+             # Ensure SSE drain loops can terminate without relying on polling
+             # agent_task.done(), which can race with queue timeout checks.
+             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+ 
+             return await self._write_sse_chat_completion(
+-                request, completion_id, model_name, created, _stream_q,
++                request, completion_id, response_model_name, created, _stream_q,
+                 agent_task, agent_ref, session_id=session_id,
+                 gateway_session_key=gateway_session_key,
+             )
+@@ -1961,11 +2736,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=system_prompt,
+                 session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                request_model_override=request_model_override,
+             )
+ 
+         idempotency_key = request.headers.get("Idempotency-Key")
+         if idempotency_key:
+-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
++            fp = _make_request_fingerprint(body, keys=["model", "provider", "messages", "tools", "tool_choice", "stream"])
+             try:
+                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+             except Exception as e:
+@@ -2031,7 +2807,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             "id": completion_id,
+             "object": "chat.completion",
+             "created": created,
+-            "model": model_name,
++            "model": response_model_name,
+             "choices": [
+                 {
+                     "index": 0,
+@@ -2056,10 +2832,18 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "error": err_msg,
+                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+             }
++            if response_provider_name:
++                response_data["hermes"]["provider"] = response_provider_name
++                response_data["hermes"]["model"] = response_model_name
+             response_headers["X-Hermes-Completed"] = "false"
+             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
+             if err_msg:
+                 response_headers["X-Hermes-Error"] = err_msg[:200]
++        elif response_provider_name:
++            response_data["hermes"] = {
++                "provider": response_provider_name,
++                "model": response_model_name,
++            }
+ 
+         return web.json_response(response_data, headers=response_headers)
+ 
+@@ -2342,6 +3126,14 @@ class APIServerAdapter(BasePlatformAdapter):
+             })
+             if conversation:
+                 self._response_store.set_conversation(conversation, response_id)
++            status = response_env.get("status")
++            if isinstance(status, str) and status in {"completed", "failed", "incomplete"}:
++                self._record_response_session_event(
++                    session_id=session_id,
++                    event_type=f"response.{status}",
++                    response_id=response_id,
++                    response=response_env,
++                )
+ 
+         def _persist_incomplete_if_needed() -> None:
+             """Persist an ``incomplete`` snapshot if no terminal one was written.
+@@ -2706,11 +3498,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 failed_env = _envelope("failed")
+                 failed_env["output"] = final_items
+                 failed_env["error"] = {"message": agent_error, "type": "server_error"}
+-                failed_env["usage"] = {
+-                    "input_tokens": usage.get("input_tokens", 0),
+-                    "output_tokens": usage.get("output_tokens", 0),
+-                    "total_tokens": usage.get("total_tokens", 0),
+-                }
++                failed_env["usage"] = self._responses_usage_payload(usage)
+                 _failed_history = list(conversation_history)
+                 _failed_history.append({"role": "user", "content": user_message})
+                 if final_response_text or agent_error:
+@@ -2730,11 +3518,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             else:
+                 completed_env = _envelope("completed")
+                 completed_env["output"] = final_items
+-                completed_env["usage"] = {
+-                    "input_tokens": usage.get("input_tokens", 0),
+-                    "output_tokens": usage.get("output_tokens", 0),
+-                    "total_tokens": usage.get("total_tokens", 0),
+-                }
++                completed_env["usage"] = self._responses_usage_payload(usage)
+                 full_history = self._build_response_conversation_history(
+                     conversation_history,
+                     user_message,
+@@ -2832,13 +3616,36 @@ class APIServerAdapter(BasePlatformAdapter):
+             )
+ 
+         raw_input = body.get("input")
+-        if raw_input is None:
++        force_compaction = bool(body.get("force_compaction") or body.get("compact"))
++        if raw_input is None and not force_compaction:
+             return web.json_response(_openai_error("Missing 'input' field"), status=400)
++        if raw_input is None:
++            raw_input = []
++
++        request_model_override, model_override_err = self._resolve_request_model_override(body)
++        if model_override_err is not None:
++            return model_override_err
++        response_model_name = (
++            request_model_override.get("model")
++            if request_model_override
++            else body.get("model", self._model_name)
++        )
++        response_provider_name = request_model_override.get("provider") if request_model_override else None
+ 
+         instructions = body.get("instructions")
+         previous_response_id = body.get("previous_response_id")
+         conversation = body.get("conversation")
+         store = _coerce_request_bool(body.get("store"), default=True)
++        requested_session_id = body.get("session_id")
++        if requested_session_id is not None:
++            if not isinstance(requested_session_id, str) or not requested_session_id.strip():
++                return web.json_response(_openai_error("'session_id' must be a non-empty string"), status=400)
++            requested_session_id = requested_session_id.strip()
++            if re.search(r'[\r\n\x00]', requested_session_id):
++                return web.json_response(
++                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
++                    status=400,
++                )
+ 
+         # conversation and previous_response_id are mutually exclusive
+         if conversation and previous_response_id:
+@@ -2904,6 +3711,68 @@ class APIServerAdapter(BasePlatformAdapter):
+             if instructions is None:
+                 instructions = stored.get("instructions")
+ 
++        # Reuse session from previous_response_id chain so the dashboard
++        # groups the entire conversation under one session entry.
++        session_id = stored_session_id or requested_session_id or str(uuid.uuid4())
++
++        # Append new input messages to history.  A force compaction request is
++        # a maintenance command rather than a user turn, so any supplied input
++        # is folded into the compacted history and no assistant response is run.
++        if force_compaction:
++            conversation_history.extend(input_messages)
++            if len(conversation_history) < 1:
++                return web.json_response(_openai_error("No conversation history to compact"), status=400)
++            try:
++                compacted_history, usage, effective_session_id = await self._compact_response_context(
++                    conversation_history=conversation_history,
++                    ephemeral_system_prompt=instructions,
++                    session_id=session_id,
++                    gateway_session_key=gateway_session_key,
++                    request_model_override=request_model_override,
++                    focus_topic=body.get("compaction_focus") or body.get("compact_focus"),
++                )
++            except Exception as e:
++                logger.error("Error compacting responses context: %s", e, exc_info=True)
++                return web.json_response(
++                    _openai_error(f"Compaction failed: {e}", err_type="server_error"),
++                    status=500,
++                )
++            response_id = f"resp_{uuid.uuid4().hex[:28]}"
++            created_at = int(time.time())
++            compacted_count = max(0, len(conversation_history) - len(compacted_history))
++            final_response = (
++                f"[CONTEXT COMPACTION]\n"
++                f"Compacted conversation context ({len(conversation_history)} → {len(compacted_history)} messages"
++                f"{f', removed {compacted_count}' if compacted_count else ''})."
++            )
++            output_items = [{
++                "type": "message",
++                "role": "assistant",
++                "content": [{"type": "output_text", "text": final_response}],
++            }]
++            response_data = {
++                "id": response_id,
++                "object": "response",
++                "status": "completed",
++                "created_at": created_at,
++                "model": body.get("model", self._model_name),
++                "output": output_items,
++                "usage": self._responses_usage_payload(usage),
++            }
++            if store:
++                self._response_store.put(response_id, {
++                    "response": response_data,
++                    "conversation_history": compacted_history,
++                    "instructions": instructions,
++                    "session_id": session_id,
++                })
++                if conversation:
++                    self._response_store.set_conversation(conversation, response_id)
++            response_headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
++            if gateway_session_key:
++                response_headers["X-Hermes-Session-Key"] = gateway_session_key
++            return web.json_response(response_data, headers=response_headers)
++
+         # Append new input messages to history (all but the last become history)
+         for msg in input_messages[:-1]:
+             conversation_history.append(msg)
+@@ -2919,7 +3788,7 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         # Reuse session from previous_response_id chain so the dashboard
+         # groups the entire conversation under one session entry.
+-        session_id = stored_session_id or str(uuid.uuid4())
++        session_id = stored_session_id or requested_session_id or str(uuid.uuid4())
+ 
+         stream = _coerce_request_bool(body.get("stream"), default=False)
+         if stream:
+@@ -2974,31 +3843,39 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                request_model_override=request_model_override,
+             ))
+             # Ensure SSE drain loops can terminate without relying on polling
+             # agent_task.done(), which can race with queue timeout checks.
+             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+ 
+             response_id = f"resp_{uuid.uuid4().hex[:28]}"
+-            model_name = body.get("model", self._model_name)
+             created_at = int(time.time())
++            self._active_response_agents[response_id] = agent_ref
++            if session_id:
++                self._active_response_agents_by_session[session_id] = agent_ref
+ 
+-            return await self._write_sse_responses(
+-                request=request,
+-                response_id=response_id,
+-                model=model_name,
+-                created_at=created_at,
+-                stream_q=_stream_q,
+-                agent_task=agent_task,
+-                agent_ref=agent_ref,
+-                conversation_history=conversation_history,
+-                user_message=user_message,
+-                instructions=instructions,
+-                conversation=conversation,
+-                store=store,
+-                session_id=session_id,
+-                gateway_session_key=gateway_session_key,
+-            )
++            try:
++                return await self._write_sse_responses(
++                    request=request,
++                    response_id=response_id,
++                    model=response_model_name,
++                    created_at=created_at,
++                    stream_q=_stream_q,
++                    agent_task=agent_task,
++                    agent_ref=agent_ref,
++                    conversation_history=conversation_history,
++                    user_message=user_message,
++                    instructions=instructions,
++                    conversation=conversation,
++                    store=store,
++                    session_id=session_id,
++                    gateway_session_key=gateway_session_key,
++                )
++            finally:
++                self._active_response_agents.pop(response_id, None)
++                if session_id and self._active_response_agents_by_session.get(session_id) is agent_ref:
++                    self._active_response_agents_by_session.pop(session_id, None)
+ 
+         async def _compute_response():
+             return await self._run_agent(
+@@ -3007,13 +3884,14 @@ class APIServerAdapter(BasePlatformAdapter):
+                 ephemeral_system_prompt=instructions,
+                 session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                request_model_override=request_model_override,
+             )
+ 
+         idempotency_key = request.headers.get("Idempotency-Key")
+         if idempotency_key:
+             fp = _make_request_fingerprint(
+                 body,
+-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
++                keys=["input", "instructions", "previous_response_id", "conversation", "model", "provider", "tools"],
+             )
+             try:
+                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+@@ -3064,14 +3942,15 @@ class APIServerAdapter(BasePlatformAdapter):
+             "object": "response",
+             "status": "completed",
+             "created_at": created_at,
+-            "model": body.get("model", self._model_name),
++            "model": response_model_name,
+             "output": output_items,
+-            "usage": {
+-                "input_tokens": usage.get("input_tokens", 0),
+-                "output_tokens": usage.get("output_tokens", 0),
+-                "total_tokens": usage.get("total_tokens", 0),
+-            },
++            "usage": self._responses_usage_payload(usage),
+         }
++        if response_provider_name:
++            response_data["hermes"] = {
++                "provider": response_provider_name,
++                "model": response_model_name,
++            }
+ 
+         # Store the complete response object for future chaining / GET retrieval
+         if store:
+@@ -3085,6 +3964,12 @@ class APIServerAdapter(BasePlatformAdapter):
+             # conversation name automatically chains to this response
+             if conversation:
+                 self._response_store.set_conversation(conversation, response_id)
++        self._record_response_session_event(
++            session_id=session_id,
++            event_type="response.completed",
++            response_id=response_id,
++            response=response_data,
++        )
+ 
+         response_headers = {"X-Hermes-Session-Id": session_id}
+         if gateway_session_key:
+@@ -3092,9 +3977,245 @@ class APIServerAdapter(BasePlatformAdapter):
+         return web.json_response(response_data, headers=response_headers)
+ 
+     # ------------------------------------------------------------------
+-    # GET / DELETE response endpoints
++    # Responses steer / GET / DELETE endpoints
+     # ------------------------------------------------------------------
+ 
++    async def _resolve_active_response_agent(self, agent_ref: Optional[list]) -> Optional[Any]:
++        """Return a live AIAgent from an active Responses API ref, waiting briefly."""
++        if agent_ref is None:
++            return None
++        for _ in range(20):
++            agent = agent_ref[0] if agent_ref else None
++            if agent is not None:
++                return agent
++            await asyncio.sleep(0.025)
++        return None
++
++    async def _handle_steer_response(self, request: "web.Request") -> "web.Response":
++        """POST /v1/responses/{response_id}/steer — call AIAgent.steer()."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        response_id = request.match_info["response_id"]
++        agent = await self._resolve_active_response_agent(self._active_response_agents.get(response_id))
++        if agent is None or not hasattr(agent, "steer"):
++            return web.json_response(_openai_error(f"Active response not found: {response_id}"), status=404)
++        return await self._handle_steer_active_agent(request, agent, {"response_id": response_id})
++
++    async def _handle_steer_session(self, request: "web.Request") -> "web.Response":
++        """POST /v1/sessions/{session_id}/steer — steer active response by session id."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        agent = await self._resolve_active_response_agent(
++            self._active_response_agents_by_session.get(session_id)
++        )
++        if agent is None or not hasattr(agent, "steer"):
++            return web.json_response(
++                _openai_error(f"No active response for session: {session_id}"),
++                status=404,
++            )
++        return await self._handle_steer_active_agent(request, agent, {"session_id": session_id})
++
++    async def _handle_halt_session(self, request: "web.Request") -> "web.Response":
++        """POST /v1/sessions/{session_id}/halt — interrupt active work by session id."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        agent = await self._resolve_active_response_agent(
++            self._active_response_agents_by_session.get(session_id)
++        )
++        if agent is None:
++            return web.json_response(
++                _openai_error(f"No active response for session: {session_id}"),
++                status=404,
++            )
++        reason = "Halt requested via API"
++        try:
++            body = await request.json()
++            if isinstance(body.get("reason"), str) and body.get("reason").strip():
++                reason = body.get("reason").strip()
++        except Exception:
++            pass
++        try:
++            agent.interrupt(reason)
++        except Exception:
++            pass
++        return web.json_response({
++            "object": "hermes.session.halt",
++            "session_id": session_id,
++            "accepted": True,
++            "status": "stopping",
++        })
++
++    async def _handle_queue_session(self, request: "web.Request") -> "web.Response":
++        """POST /v1/sessions/{session_id}/queue — queue a follow-up for active session chat."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        gateway_session_key, key_err = self._parse_session_key_header(request)
++        if key_err is not None:
++            return key_err
++        session_id = request.match_info["session_id"]
++        _, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        if session_id not in self._active_response_agents_by_session:
++            return web.json_response(
++                _openai_error(f"No active response for session: {session_id}", code="session_not_active"),
++                status=409,
++            )
++        body, err = await self._read_json_body(request)
++        if err:
++            return err
++        user_message, err = _session_chat_queued_user_message(body)
++        if err is not None:
++            return err
++        system_prompt = body.get("system_message") or body.get("instructions")
++        if system_prompt is not None and not isinstance(system_prompt, str):
++            return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
++        request_model_override, model_override_err = self._resolve_request_model_override(body)
++        if model_override_err is not None:
++            return model_override_err
++        queued_run_id = f"run_{uuid.uuid4().hex}"
++        self._session_chat_pending_messages.setdefault(session_id, []).append({
++            "run_id": queued_run_id,
++            "user_message": user_message,
++            "system_prompt": system_prompt,
++            "request_model_override": request_model_override,
++            "gateway_session_key": gateway_session_key,
++            "queued_at": time.time(),
++        })
++        return web.json_response({
++            "object": "hermes.session.queued_message",
++            "session_id": session_id,
++            "run_id": queued_run_id,
++            "accepted": True,
++            "queued": True,
++        }, status=202)
++
++    async def _handle_steer_active_agent(
++        self,
++        request: "web.Request",
++        agent: Any,
++        extra: Dict[str, str],
++    ) -> "web.Response":
++        try:
++            body = await request.json()
++        except (json.JSONDecodeError, Exception):
++            return web.json_response(
++                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
++                status=400,
++            )
++        text = body.get("input") or body.get("prompt") or body.get("text")
++        if not isinstance(text, str) or not text.strip():
++            return web.json_response(_openai_error("Missing non-empty steer text"), status=400)
++        try:
++            accepted = bool(agent.steer(text))
++        except Exception as exc:  # noqa: BLE001
++            logger.error("Responses steer failed: %s", exc, exc_info=True)
++            return web.json_response(
++                _openai_error(f"Steer failed: {exc}", err_type="server_error"),
++                status=500,
++            )
++        if not accepted:
++            return web.json_response(_openai_error("Steer rejected"), status=400)
++        return web.json_response({"object": "response.steer", "accepted": True, **extra})
++
++    def _audio_extension_for_mime(self, mime_type: str) -> str:
++        normalized = (mime_type or "").split(";", 1)[0].strip().lower()
++        return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
++
++    async def _read_limited_audio_body(self, request: "web.Request") -> bytes:
++        chunks: List[bytes] = []
++        total = 0
++        async for chunk in request.content.iter_chunked(1024 * 1024):
++            total += len(chunk)
++            if total > MAX_AUDIO_TRANSCRIPTION_BYTES:
++                raise ValueError("Audio recording is too large")
++            chunks.append(bytes(chunk))
++        return b"".join(chunks)
++
++    async def _handle_audio_transcriptions(self, request: "web.Request") -> "web.Response":
++        """POST /v1/audio/transcriptions — transcribe an uploaded audio file."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++
++        mime_type = (request.headers.get("Content-Type") or "audio/webm").strip()
++        normalized_mime_type = mime_type.split(";", 1)[0].lower()
++        if not (
++            normalized_mime_type.startswith("audio/")
++            or normalized_mime_type == "video/webm"
++            or normalized_mime_type == "application/octet-stream"
++        ):
++            return web.json_response(
++                _openai_error("Payload must be an audio recording", code="invalid_audio_type"),
++                status=400,
++            )
++
++        try:
++            audio_bytes = await self._read_limited_audio_body(request)
++        except ValueError:
++            return web.json_response(
++                _openai_error("Audio recording is too large", code="body_too_large"),
++                status=413,
++            )
++
++        if not audio_bytes:
++            return web.json_response(
++                _openai_error("Audio recording is empty", code="empty_audio"),
++                status=400,
++            )
++
++        temp_path = ""
++        try:
++            suffix = self._audio_extension_for_mime(mime_type)
++            with tempfile.NamedTemporaryFile(
++                prefix="hermes-api-audio-",
++                suffix=suffix,
++                delete=False,
++            ) as tmp:
++                tmp.write(audio_bytes)
++                temp_path = tmp.name
++
++            from tools.transcription_tools import transcribe_audio
++
++            result = await asyncio.to_thread(transcribe_audio, temp_path)
++        except Exception as exc:  # noqa: BLE001
++            logger.error("Audio transcription failed: %s", exc, exc_info=True)
++            return web.json_response(
++                _openai_error(f"Transcription failed: {exc}", err_type="server_error"),
++                status=500,
++            )
++        finally:
++            if temp_path:
++                try:
++                    os.unlink(temp_path)
++                except OSError:
++                    pass
++
++        if not result.get("success"):
++            return web.json_response(
++                _openai_error(
++                    str(result.get("error") or "Transcription failed"),
++                    code="transcription_failed",
++                ),
++                status=400,
++            )
++
++        transcript = str(result.get("transcript") or "").strip()
++        return web.json_response(
++            {
++                "object": "audio.transcription",
++                "text": transcript,
++                "transcript": transcript,
++                "provider": result.get("provider"),
++            }
++        )
++
+     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
+         """GET /v1/responses/{response_id} — retrieve a stored response."""
+         auth_err = self._check_auth(request)
+@@ -3568,6 +4689,57 @@ class APIServerAdapter(BasePlatformAdapter):
+     # Agent execution
+     # ------------------------------------------------------------------
+ 
++    async def _compact_response_context(
++        self,
++        conversation_history: List[Dict[str, Any]],
++        ephemeral_system_prompt: Optional[str] = None,
++        session_id: Optional[str] = None,
++        gateway_session_key: Optional[str] = None,
++        request_model_override: Optional[Dict[str, Any]] = None,
++        focus_topic: Optional[str] = None,
++    ) -> tuple:
++        """Force a context compaction without running a user-visible assistant turn."""
++        loop = asyncio.get_running_loop()
++
++        def _run():
++            agent = self._create_agent(
++                ephemeral_system_prompt=ephemeral_system_prompt,
++                session_id=session_id,
++                gateway_session_key=gateway_session_key,
++                request_model_override=request_model_override,
++            )
++            if not getattr(agent, "compression_enabled", False):
++                raise RuntimeError("Compression is disabled in config.")
++            history = list(conversation_history)
++            if len(history) < 4:
++                usage = self._agent_usage_snapshot(agent)
++                _eff_sid = getattr(agent, "session_id", session_id)
++                return history, usage, _eff_sid
++            try:
++                from agent.model_metadata import estimate_request_tokens_rough
++
++                system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
++                tools = getattr(agent, "tools", None) or None
++                approx_tokens = estimate_request_tokens_rough(
++                    history,
++                    system_prompt=system_prompt,
++                    tools=tools,
++                )
++            except Exception:
++                approx_tokens = None
++            compacted, _ = agent._compress_context(
++                history,
++                ephemeral_system_prompt,
++                approx_tokens=approx_tokens,
++                task_id=session_id or "api_server_compact",
++                focus_topic=focus_topic,
++            )
++            usage = self._agent_usage_snapshot(agent)
++            _eff_sid = getattr(agent, "session_id", session_id)
++            return compacted, usage, _eff_sid
++
++        return await loop.run_in_executor(None, _run)
++
+     async def _run_agent(
+         self,
+         user_message: str,
+@@ -3580,6 +4752,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         tool_complete_callback=None,
+         agent_ref: Optional[list] = None,
+         gateway_session_key: Optional[str] = None,
++        request_model_override: Optional[Dict[str, Any]] = None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+@@ -3612,6 +4785,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     tool_start_callback=tool_start_callback,
+                     tool_complete_callback=tool_complete_callback,
+                     gateway_session_key=gateway_session_key,
++                    request_model_override=request_model_override,
+                 )
+                 if agent_ref is not None:
+                     agent_ref[0] = agent
+@@ -3621,11 +4795,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     conversation_history=conversation_history,
+                     task_id=effective_task_id,
+                 )
+-                usage = {
+-                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+-                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+-                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+-                }
++                usage = self._agent_usage_snapshot(agent)
+                 # Include the effective session ID in the result so callers
+                 # (e.g. X-Hermes-Session-Id header) can track compression-
+                 # triggered session rotations. (#16938)
+@@ -3638,6 +4808,76 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         return await loop.run_in_executor(None, _run)
+ 
++    @staticmethod
++    def _responses_usage_payload(usage: Dict[str, Any]) -> Dict[str, Any]:
++        """Return Responses API usage with Hermes context-compressor fields preserved."""
++        def _number(value: Any) -> int | float:
++            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
++
++        payload = {
++            "input_tokens": _number(usage.get("input_tokens", 0)),
++            "output_tokens": _number(usage.get("output_tokens", 0)),
++            "total_tokens": _number(usage.get("total_tokens", 0)),
++        }
++        optional_aliases = (
++            "cached_input_tokens",
++            "api_calls",
++            "current_context_tokens",
++            "context_tokens",
++            "last_prompt_tokens",
++            "context_length",
++            "context_percent",
++            "compression_count",
++            "compressions",
++        )
++        for key in optional_aliases:
++            value = usage.get(key)
++            if isinstance(value, (int, float)) and not isinstance(value, bool):
++                payload[key] = value
++        return payload
++
++    @staticmethod
++    def _agent_usage_snapshot(agent) -> Dict[str, Any]:
++        """Return token/context usage fields matching Hermes /usage as closely as possible."""
++        def _number(value: Any) -> int | float:
++            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
++
++        def _optional_number(value: Any) -> int | float | None:
++            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
++
++        usage = {
++            "input_tokens": _number(getattr(agent, "session_prompt_tokens", 0)),
++            "output_tokens": _number(getattr(agent, "session_completion_tokens", 0)),
++            "total_tokens": _number(getattr(agent, "session_total_tokens", 0)),
++        }
++        api_calls = _optional_number(getattr(agent, "session_api_calls", None))
++        if api_calls is not None:
++            usage["api_calls"] = api_calls
++
++        cache_read_tokens = _optional_number(getattr(agent, "session_cache_read_tokens", None))
++        cache_write_tokens = _optional_number(getattr(agent, "session_cache_write_tokens", None))
++        cache_total = (cache_read_tokens or 0) + (cache_write_tokens or 0)
++        if cache_total:
++            usage["cached_input_tokens"] = cache_total
++
++        compressor = getattr(agent, "context_compressor", None)
++        if compressor:
++            context_tokens = _optional_number(getattr(compressor, "last_prompt_tokens", None))
++            context_length = _optional_number(getattr(compressor, "context_length", None))
++            compression_count = _optional_number(getattr(compressor, "compression_count", None))
++            if context_tokens is not None:
++                usage["current_context_tokens"] = context_tokens
++                usage["context_tokens"] = context_tokens
++                usage["last_prompt_tokens"] = context_tokens
++            if compression_count is not None:
++                usage["compression_count"] = compression_count
++                usage["compressions"] = compression_count
++            if context_length:
++                usage["context_length"] = context_length
++                if context_tokens is not None:
++                    usage["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
++        return usage
++
+     # ------------------------------------------------------------------
+     # /v1/runs — structured event streaming
+     # ------------------------------------------------------------------
+@@ -3738,6 +4978,8 @@ class APIServerAdapter(BasePlatformAdapter):
+         if not user_message:
+             return web.json_response(_openai_error("No user message found in input"), status=400)
+ 
++        response_model_name = body.get("model", self._model_name)
++
+         instructions = body.get("instructions")
+         previous_response_id = body.get("previous_response_id")
+ 
+@@ -3787,6 +5029,13 @@ class APIServerAdapter(BasePlatformAdapter):
+ 
+         run_id = f"run_{uuid.uuid4().hex}"
+         session_id = body.get("session_id") or stored_session_id or run_id
++        if (
++            session_id
++            and not conversation_history
++            and not previous_response_id
++            and not (isinstance(raw_input, list) and len(raw_input) > 1)
++        ):
++            conversation_history = self._conversation_history_for_session(session_id)
+         approval_session_key = gateway_session_key or session_id or run_id
+         ephemeral_system_prompt = instructions
+         loop = asyncio.get_running_loop()
+@@ -3817,20 +5066,32 @@ class APIServerAdapter(BasePlatformAdapter):
+             "queued",
+             created_at=created_at,
+             session_id=session_id,
+-            model=body.get("model", self._model_name),
++            model=response_model_name,
++        )
++        self._record_run_session_event(
++            session_id=session_id,
++            event_type="run.started",
++            run_id=run_id,
++            payload={
++                "status": "queued",
++                "model": response_model_name,
++                "timestamp": created_at,
++            },
+         )
+ 
+         async def _run_and_close():
+             try:
+                 self._set_run_status(run_id, "running")
+-                agent = self._create_agent(
+-                    ephemeral_system_prompt=ephemeral_system_prompt,
++                self._record_run_session_event(
+                     session_id=session_id,
+-                    stream_delta_callback=_text_cb,
+-                    tool_progress_callback=event_cb,
+-                    gateway_session_key=gateway_session_key,
++                    event_type="run.running",
++                    run_id=run_id,
++                    payload={
++                        "status": "running",
++                        "model": response_model_name,
++                        "timestamp": time.time(),
++                    },
+                 )
+-                self._active_run_agents[run_id] = agent
+ 
+                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                     event = dict(approval_data or {})
+@@ -3860,6 +5121,39 @@ class APIServerAdapter(BasePlatformAdapter):
+                     )
+ 
+                     effective_task_id = session_id or run_id
++                    request_model_override, model_override_err = self._resolve_request_model_override(body)
++                    if model_override_err is not None:
++                        error_text = getattr(model_override_err, "text", None)
++                        return {
++                            "failed": True,
++                            "error": error_text if isinstance(error_text, str) else "Invalid provider/model selection",
++                        }, {}
++                    agent = self._create_agent(
++                        ephemeral_system_prompt=ephemeral_system_prompt,
++                        session_id=session_id,
++                        stream_delta_callback=_text_cb,
++                        tool_progress_callback=event_cb,
++                        tool_start_callback=lambda tool_call_id, function_name, function_args: self._record_live_tool_session_item(
++                            session_id=session_id,
++                            item_type="tool_call",
++                            tool_call_id=tool_call_id,
++                            name=function_name,
++                            arguments=function_args or {},
++                            response_id=run_id,
++                        ),
++                        tool_complete_callback=lambda tool_call_id, function_name, function_args, function_result: self._record_live_tool_session_item(
++                            session_id=session_id,
++                            item_type="tool_result",
++                            tool_call_id=tool_call_id,
++                            name=function_name,
++                            arguments=function_args or {},
++                            content=function_result,
++                            response_id=run_id,
++                        ),
++                        gateway_session_key=gateway_session_key,
++                        request_model_override=request_model_override,
++                    )
++                    self._active_run_agents[run_id] = agent
+                     approval_token = None
+                     session_tokens = []
+                     try:
+@@ -3891,11 +5185,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                                     clear_session_vars(session_tokens)
+                                 except Exception:
+                                     pass
+-                    u = {
+-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+-                    }
++                    u = self._agent_usage_snapshot(agent)
+                     return r, u
+ 
+                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+@@ -3916,6 +5206,16 @@ class APIServerAdapter(BasePlatformAdapter):
+                         error=error_msg,
+                         last_event="run.failed",
+                     )
++                    self._record_run_session_event(
++                        session_id=session_id,
++                        event_type="run.failed",
++                        run_id=run_id,
++                        payload={
++                            "status": "failed",
++                            "error": error_msg,
++                            "timestamp": time.time(),
++                        },
++                    )
+                 else:
+                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                     q.put_nowait({
+@@ -3932,6 +5232,17 @@ class APIServerAdapter(BasePlatformAdapter):
+                         usage=usage,
+                         last_event="run.completed",
+                     )
++                    self._record_run_session_event(
++                        session_id=session_id,
++                        event_type="run.completed",
++                        run_id=run_id,
++                        payload={
++                            "status": "completed",
++                            "output": final_response,
++                            "usage": usage,
++                            "timestamp": time.time(),
++                        },
++                    )
+             except asyncio.CancelledError:
+                 self._set_run_status(
+                     run_id,
+@@ -3946,6 +5257,15 @@ class APIServerAdapter(BasePlatformAdapter):
+                     })
+                 except Exception:
+                     pass
++                self._record_run_session_event(
++                    session_id=session_id,
++                    event_type="run.cancelled",
++                    run_id=run_id,
++                    payload={
++                        "status": "cancelled",
++                        "timestamp": time.time(),
++                    },
++                )
+                 raise
+             except Exception as exc:
+                 logger.exception("[api_server] run %s failed", run_id)
+@@ -3964,6 +5284,16 @@ class APIServerAdapter(BasePlatformAdapter):
+                     })
+                 except Exception:
+                     pass
++                self._record_run_session_event(
++                    session_id=session_id,
++                    event_type="run.failed",
++                    run_id=run_id,
++                    payload={
++                        "status": "failed",
++                        "error": str(exc),
++                        "timestamp": time.time(),
++                    },
++                )
+             finally:
+                 # If the asyncio wrapper is cancelled (for example via
+                 # /stop), the executor thread can still be blocked waiting
+@@ -4253,17 +5583,30 @@ class APIServerAdapter(BasePlatformAdapter):
+             self._app.router.add_get("/v1/skills", self._handle_skills)
+             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
++            self._app.router.add_get("/v1/sessions/active", self._handle_list_active_sessions)
++            self._app.router.add_get("/v1/sessions/{session_id}/state", self._handle_session_state)
++            self._app.router.add_get("/v1/sessions/{session_id}/items", self._handle_session_items)
++            self._app.router.add_get("/v1/sessions/{session_id}/events", self._handle_session_events)
++            self._app.router.add_get("/v1/session_events/firehose", self._handle_session_firehose)
++            self._app.router.add_post("/v1/session_events/ack", self._handle_session_events_ack)
+             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+             self._app.router.add_post("/api/sessions", self._handle_create_session)
+             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
+             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
++            self._app.router.add_get("/api/sessions/{session_id}/active-run", self._handle_session_active_run)
++            self._app.router.add_get("/api/session-runs/{run_id}/events", self._handle_session_run_events)
+             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
+             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+             self._app.router.add_post("/v1/responses", self._handle_responses)
++            self._app.router.add_post("/v1/responses/{response_id}/steer", self._handle_steer_response)
++            self._app.router.add_post("/v1/sessions/{session_id}/steer", self._handle_steer_session)
++            self._app.router.add_post("/v1/sessions/{session_id}/halt", self._handle_halt_session)
++            self._app.router.add_post("/v1/sessions/{session_id}/queue", self._handle_queue_session)
++            self._app.router.add_post("/v1/audio/transcriptions", self._handle_audio_transcriptions)
+             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
+             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+             # Cron jobs management API
+diff --git a/hermes_state.py b/hermes_state.py
+index d913942f4..108d5fd02 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -93,6 +93,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
+     ids = _collect_delegate_child_ids(conn, parent_ids)
+     if ids:
+         ph = ",".join("?" * len(ids))
++        conn.execute(f"DELETE FROM session_events WHERE session_id IN ({ph})", ids)
+         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
+         # FK safety: orphan any untagged stragglers pointing at a doomed row.
+         conn.execute(
+@@ -582,12 +583,36 @@ CREATE TABLE IF NOT EXISTS compression_locks (
+     expires_at REAL NOT NULL
+ );
+ 
++CREATE TABLE IF NOT EXISTS session_events (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    event_id TEXT UNIQUE,
++    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++    event_type TEXT NOT NULL,
++    item_id TEXT,
++    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
++    response_id TEXT,
++    payload TEXT NOT NULL,
++    created_at REAL NOT NULL
++);
++
++-- Per-consumer firehose acknowledgement offsets. A consumer (e.g. "nako")
++-- records the highest globally-ordered session_events.id it has durably
++-- stored; the firehose resumes from here when no explicit `after` is given,
++-- and retention can reclaim events all consumers have acked past.
++CREATE TABLE IF NOT EXISTS session_event_consumers (
++    consumer TEXT PRIMARY KEY,
++    offset_cursor INTEGER NOT NULL DEFAULT 0,
++    updated_at REAL NOT NULL
++);
++
+ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
+ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
++CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, id);
++CREATE INDEX IF NOT EXISTS idx_session_events_cursor ON session_events(id);
+ """
+ 
+ # Indexes that reference columns added in later schema versions must be
+@@ -1014,6 +1039,342 @@ class SessionDB:
+                 self._conn.close()
+                 self._conn = None
+ 
++    @staticmethod
++    def _event_cursor_value(cursor: Any) -> int:
++        """Parse a session event cursor accepted by replay APIs."""
++        if cursor is None:
++            return 0
++        if isinstance(cursor, int):
++            return max(cursor, 0)
++        value = str(cursor).strip()
++        if value.startswith("evt:"):
++            value = value[4:]
++        try:
++            parsed = int(value)
++        except ValueError:
++            return 0
++        return max(parsed, 0)
++
++    @staticmethod
++    def _tool_call_fields(tool_call: Any, index: int) -> Dict[str, Any]:
++        if not isinstance(tool_call, dict):
++            return {
++                "tool_call_id": f"tool_call_{index}",
++                "tool_name": "tool",
++                "tool_arguments": "",
++            }
++        function = tool_call.get("function")
++        function = function if isinstance(function, dict) else {}
++        tool_call_id = (
++            tool_call.get("id")
++            or tool_call.get("tool_call_id")
++            or function.get("id")
++            or f"tool_call_{index}"
++        )
++        tool_name = tool_call.get("name") or function.get("name") or "tool"
++        arguments = tool_call.get("arguments")
++        if arguments is None:
++            arguments = function.get("arguments")
++        if isinstance(arguments, (dict, list)):
++            arguments = json.dumps(arguments, sort_keys=True)
++        elif arguments is None:
++            arguments = ""
++        else:
++            arguments = str(arguments)
++        return {
++            "tool_call_id": str(tool_call_id),
++            "tool_name": str(tool_name),
++            "tool_arguments": arguments,
++        }
++
++    @staticmethod
++    def _session_items_from_message(message: Dict[str, Any]) -> List[Dict[str, Any]]:
++        """Project one durable message row into stable Hermes session items."""
++        message_id = message.get("id")
++        session_id = message.get("session_id")
++        response_id = message.get("response_id")
++        role = str(message.get("role") or "unknown")
++        timestamp = message.get("timestamp")
++        items: List[Dict[str, Any]] = []
++
++        content = message.get("content")
++        if role == "tool":
++            suffix = message.get("tool_call_id") or message_id
++            item_id = f"msg:{message_id}:tool_result:{suffix}"
++            items.append({
++                "id": item_id,
++                "object": "hermes.session.item",
++                "type": "tool_result",
++                "session_id": session_id,
++                "message_id": message_id,
++                "role": role,
++                "content": content,
++                "tool_call_id": message.get("tool_call_id"),
++                "tool_name": message.get("tool_name") or "tool",
++                "created_at": timestamp,
++                "committed_at": timestamp,
++                "response_id": response_id,
++            })
++            return items
++
++        if content not in (None, ""):
++            items.append({
++                "id": f"msg:{message_id}",
++                "object": "hermes.session.item",
++                "type": "message",
++                "session_id": session_id,
++                "message_id": message_id,
++                "role": role,
++                "content": content,
++                "created_at": timestamp,
++                "committed_at": timestamp,
++                "response_id": response_id,
++            })
++
++        if role == "assistant":
++            for index, tool_call in enumerate(message.get("tool_calls") or []):
++                fields = SessionDB._tool_call_fields(tool_call, index)
++                tool_call_id = fields["tool_call_id"]
++                items.append({
++                    "id": f"msg:{message_id}:tool_call:{tool_call_id}",
++                    "object": "hermes.session.item",
++                    "type": "tool_call",
++                    "session_id": session_id,
++                    "message_id": message_id,
++                    "role": role,
++                    "tool_call_id": tool_call_id,
++                    "tool_name": fields["tool_name"],
++                    "tool_arguments": fields["tool_arguments"],
++                    "created_at": timestamp,
++                    "committed_at": timestamp,
++                    "response_id": response_id,
++                })
++
++        return items
++
++    @staticmethod
++    def _decode_event_row(row: sqlite3.Row) -> Dict[str, Any]:
++        event = dict(row)
++        payload = event.get("payload")
++        if isinstance(payload, str):
++            try:
++                event["payload"] = json.loads(payload)
++            except (json.JSONDecodeError, TypeError):
++                event["payload"] = {}
++        event["cursor"] = str(event["id"])
++        if not event.get("event_id"):
++            event["event_id"] = f"evt:{event['id']}"
++        return event
++
++    def _insert_session_event(
++        self,
++        conn: sqlite3.Connection,
++        *,
++        session_id: str,
++        event_type: str,
++        payload: Dict[str, Any],
++        item_id: Optional[str] = None,
++        message_id: Optional[int] = None,
++        response_id: Optional[str] = None,
++        created_at: Optional[float] = None,
++    ) -> int:
++        cursor = conn.execute(
++            """INSERT INTO session_events (
++                   session_id, event_type, item_id, message_id, response_id,
++                   payload, created_at
++               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
++            (
++                session_id,
++                event_type,
++                item_id,
++                message_id,
++                response_id,
++                json.dumps(payload, sort_keys=True, default=str),
++                created_at if created_at is not None else time.time(),
++            ),
++        )
++        event_row_id = cursor.lastrowid
++        conn.execute(
++            "UPDATE session_events SET event_id = ? WHERE id = ?",
++            (f"evt:{event_row_id}", event_row_id),
++        )
++        return int(event_row_id)
++
++    def append_session_event(
++        self,
++        session_id: str,
++        event_type: str,
++        payload: Optional[Dict[str, Any]] = None,
++        *,
++        item_id: Optional[str] = None,
++        message_id: Optional[int] = None,
++        response_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Append a durable session event and return the stored event."""
++        def _do(conn):
++            return self._insert_session_event(
++                conn,
++                session_id=session_id,
++                event_type=event_type,
++                payload=payload or {},
++                item_id=item_id,
++                message_id=message_id,
++                response_id=response_id,
++            )
++
++        event_row_id = self._execute_write(_do)
++        events = self.list_session_events(after=event_row_id - 1, limit=1)
++        return events[0]
++
++    def list_session_events(
++        self,
++        session_id: Optional[str] = None,
++        after: Any = None,
++        limit: int = 100,
++    ) -> List[Dict[str, Any]]:
++        """Return durable session events after a cursor."""
++        cursor_value = self._event_cursor_value(after)
++        limit = max(1, min(int(limit or 100), 1000))
++        where = ["id > ?"]
++        params: List[Any] = [cursor_value]
++        if session_id:
++            where.append("session_id = ?")
++            params.append(session_id)
++        params.append(limit)
++        with self._lock:
++            rows = self._conn.execute(
++                f"""SELECT * FROM session_events
++                    WHERE {' AND '.join(where)}
++                    ORDER BY id
++                    LIMIT ?""",
++                params,
++            ).fetchall()
++        return [self._decode_event_row(row) for row in rows]
++
++    def latest_session_event_cursor(self, session_id: Optional[str] = None) -> Optional[str]:
++        where = ""
++        params: Tuple[Any, ...] = ()
++        if session_id:
++            where = "WHERE session_id = ?"
++            params = (session_id,)
++        with self._lock:
++            row = self._conn.execute(
++                f"SELECT MAX(id) AS max_id FROM session_events {where}",
++                params,
++            ).fetchone()
++        if not row or row["max_id"] is None:
++            return None
++        return str(row["max_id"])
++
++    def get_consumer_offset(self, consumer: str) -> Optional[str]:
++        """Return the acknowledged firehose cursor for *consumer*, or None."""
++        if not consumer:
++            return None
++        with self._lock:
++            row = self._conn.execute(
++                "SELECT offset_cursor FROM session_event_consumers WHERE consumer = ?",
++                (consumer,),
++            ).fetchone()
++        if not row or row["offset_cursor"] is None:
++            return None
++        return str(row["offset_cursor"])
++
++    def acknowledge_consumer_offset(self, consumer: str, cursor: Any) -> str:
++        """Durably record that *consumer* has stored every event up to *cursor*.
++
++        Idempotent and monotonic: the stored offset only ever advances
++        (offset = max(stored, cursor)), so replays of an already-acked cursor
++        are no-ops and an out-of-order ack cannot rewind progress. Returns the
++        resulting offset as a cursor string.
++        """
++        if not consumer:
++            raise ValueError("consumer is required")
++        target = self._event_cursor_value(cursor)
++
++        def _do(conn):
++            conn.execute(
++                """INSERT INTO session_event_consumers (consumer, offset_cursor, updated_at)
++                       VALUES (?, ?, ?)
++                   ON CONFLICT(consumer) DO UPDATE SET
++                       offset_cursor = MAX(offset_cursor, excluded.offset_cursor),
++                       updated_at = excluded.updated_at""",
++                (consumer, target, time.time()),
++            )
++            row = conn.execute(
++                "SELECT offset_cursor FROM session_event_consumers WHERE consumer = ?",
++                (consumer,),
++            ).fetchone()
++            return str(row["offset_cursor"])
++
++        return self._execute_write(_do)
++
++    def get_session_items(self, session_id: str) -> List[Dict[str, Any]]:
++        items: List[Dict[str, Any]] = []
++        for message in self.get_messages(session_id):
++            items.extend(self._session_items_from_message(message))
++        return items
++
++    def get_session_sync_state(self, session_id: str) -> Optional[Dict[str, Any]]:
++        session = self.get_session(session_id)
++        if not session:
++            return None
++        items = self.get_session_items(session_id)
++        pending_tool_calls = {
++            item["tool_call_id"]
++            for item in items
++            if item.get("type") == "tool_call" and item.get("tool_call_id")
++        }
++        for item in items:
++            if item.get("type") == "tool_result" and item.get("tool_call_id"):
++                pending_tool_calls.discard(item["tool_call_id"])
++        if session.get("ended_at") is not None:
++            state = "failed" if session.get("end_reason") == "error" else "completed"
++        elif pending_tool_calls:
++            state = "interrupted"
++        else:
++            state = "idle"
++        return {
++            "object": "hermes.session.state",
++            "session_id": session_id,
++            "state": state,
++            "status": state,
++            "active": session.get("ended_at") is None,
++            "ended_at": session.get("ended_at"),
++            "end_reason": session.get("end_reason"),
++            "pending_tool_call_ids": sorted(pending_tool_calls),
++            "latest_event_cursor": self.latest_session_event_cursor(session_id),
++            "item_count": len(items),
++        }
++
++    def list_sync_sessions(
++        self,
++        *,
++        limit: int = 200,
++        recent_seconds: int = 14 * 24 * 60 * 60,
++    ) -> List[Dict[str, Any]]:
++        """List sessions Nako should consider during startup reconciliation."""
++        limit = max(1, min(int(limit or 200), 1000))
++        cutoff = time.time() - max(0, recent_seconds)
++        sessions = self.list_sessions_rich(
++            limit=limit,
++            offset=0,
++            include_children=True,
++            order_by_last_active=True,
++        )
++        result = []
++        for session in sessions:
++            last_active = session.get("last_active") or session.get("started_at") or 0
++            recoverable = session.get("ended_at") is None or float(last_active) >= cutoff
++            if not recoverable:
++                continue
++            sync_state = self.get_session_sync_state(session["id"])
++            result.append({
++                **session,
++                "sync_state": sync_state,
++                "latest_event_cursor": self.latest_session_event_cursor(session["id"]),
++            })
++        return result
++
+     @staticmethod
+     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+         """Extract expected columns per table from SCHEMA_SQL.
+@@ -1382,11 +1743,25 @@ class SessionDB:
+         intentionally need to re-end a closed session with a new reason.
+         """
+         def _do(conn):
+-            conn.execute(
++            ended_at = time.time()
++            cursor = conn.execute(
+                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                 "WHERE id = ? AND ended_at IS NULL",
+-                (time.time(), end_reason, session_id),
++                (ended_at, end_reason, session_id),
+             )
++            if cursor.rowcount > 0:
++                self._insert_session_event(
++                    conn,
++                    session_id=session_id,
++                    event_type="session.ended",
++                    payload={
++                        "session_id": session_id,
++                        "state": "failed" if end_reason == "error" else "completed",
++                        "end_reason": end_reason,
++                        "ended_at": ended_at,
++                    },
++                    created_at=ended_at,
++                )
+         self._execute_write(_do)
+ 
+     def reopen_session(self, session_id: str) -> None:
+@@ -1396,6 +1771,12 @@ class SessionDB:
+                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                 (session_id,),
+             )
++            self._insert_session_event(
++                conn,
++                session_id=session_id,
++                event_type="session.reopened",
++                payload={"session_id": session_id, "state": "idle"},
++            )
+         self._execute_write(_do)
+ 
+     def update_session_cwd(self, session_id: str, cwd: str) -> None:
+@@ -2494,6 +2875,7 @@ class SessionDB:
+         codex_reasoning_items: Any = None,
+         codex_message_items: Any = None,
+         platform_message_id: str = None,
++        response_id: str = None,
+         observed: bool = False,
+         timestamp: Any = None,
+     ) -> int:
+@@ -2543,6 +2925,7 @@ class SessionDB:
+             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+ 
+         def _do(conn):
++            timestamp = time.time()
+             cursor = conn.execute(
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, timestamp, token_count, finish_reason,
+@@ -2582,6 +2965,34 @@ class SessionDB:
+                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                     (session_id,),
+                 )
++            message_payload = {
++                "id": msg_id,
++                "session_id": session_id,
++                "role": role,
++                "content": content,
++                "tool_call_id": tool_call_id,
++                "tool_calls": tool_calls or [],
++                "tool_name": tool_name,
++                "timestamp": timestamp,
++                "token_count": token_count,
++                "finish_reason": finish_reason,
++                "reasoning": reasoning,
++                "reasoning_content": reasoning_content,
++                "response_id": response_id,
++                "observed": 1 if observed else 0,
++            }
++            items = self._session_items_from_message(message_payload)
++            for item in items:
++                self._insert_session_event(
++                    conn,
++                    session_id=session_id,
++                    event_type="session.item.upserted",
++                    item_id=item["id"],
++                    message_id=msg_id,
++                    response_id=response_id,
++                    payload={"message": message_payload, "item": item},
++                    created_at=timestamp,
++                )
+             return msg_id
+ 
+         return self._execute_write(_do)
+@@ -2634,7 +3045,7 @@ class SessionDB:
+                 msg.get("platform_message_id") or msg.get("message_id")
+             )
+ 
+-            conn.execute(
++            cursor = conn.execute(
+                 """INSERT INTO messages (session_id, role, content, tool_call_id,
+                    tool_calls, tool_name, timestamp, token_count, finish_reason,
+                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+@@ -2659,7 +3070,30 @@ class SessionDB:
+                     1 if msg.get("observed") else 0,
+                 ),
+             )
++            msg_id = cursor.lastrowid
+             inserted += 1
++            message_payload = {
++                **msg,
++                "id": msg_id,
++                "session_id": session_id,
++                "role": role,
++                "timestamp": message_timestamp,
++                "tool_calls": tool_calls or [],
++                "tool_call_id": msg.get("tool_call_id"),
++                "tool_name": msg.get("tool_name"),
++                "response_id": msg.get("response_id"),
++            }
++            for item in self._session_items_from_message(message_payload):
++                self._insert_session_event(
++                    conn,
++                    session_id=session_id,
++                    event_type="session.item.upserted",
++                    item_id=item["id"],
++                    message_id=msg_id,
++                    response_id=msg.get("response_id"),
++                    payload={"message": message_payload, "item": item},
++                    created_at=message_timestamp,
++                )
+             if tool_calls is not None:
+                 tool_calls_total += (
+                     len(tool_calls) if isinstance(tool_calls, list) else 1
+@@ -2680,6 +3114,9 @@ class SessionDB:
+         """
+ 
+         def _do(conn):
++            conn.execute(
++                "DELETE FROM session_events WHERE session_id = ?", (session_id,)
++            )
+             conn.execute(
+                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
+             )
+@@ -2687,6 +3124,14 @@ class SessionDB:
+                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                 (session_id,),
+             )
++            now_ts = time.time()
++            self._insert_session_event(
++                conn,
++                session_id=session_id,
++                event_type="session.transcript.replaced",
++                payload={"session_id": session_id, "message_count": len(messages)},
++                created_at=now_ts,
++            )
+             total_messages, total_tool_calls = self._insert_message_rows(
+                 conn, session_id, messages
+             )
+@@ -4019,6 +4464,7 @@ class SessionDB:
+                 "WHERE parent_session_id = ?",
+                 (session_id,),
+             )
++            conn.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
+             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+             return True
+@@ -4137,6 +4583,10 @@ class SessionDB:
+                 f"WHERE parent_session_id IN ({existing_placeholders})",
+                 existing,
+             )
++            conn.execute(
++                f"DELETE FROM session_events WHERE session_id IN ({existing_placeholders})",
++                existing,
++            )
+             conn.execute(
+                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                 existing,
+@@ -4229,6 +4679,10 @@ class SessionDB:
+                 f"WHERE parent_session_id IN ({placeholders})",
+                 list(session_ids),
+             )
++            conn.execute(
++                f"DELETE FROM session_events WHERE session_id IN ({placeholders})",
++                list(session_ids),
++            )
+ 
+             for sid in session_ids:
+                 # DELETE FROM messages is paranoia — by construction
+@@ -4291,6 +4745,7 @@ class SessionDB:
+             )
+ 
+             for sid in session_ids:
++                conn.execute("DELETE FROM session_events WHERE session_id = ?", (sid,))
+                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                 removed_ids.append(sid)
+diff --git a/run_agent.py b/run_agent.py
+index 6f0d9cb1d..49be92459 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1666,6 +1666,7 @@ class AIAgent:
+                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                     timestamp=msg.get("timestamp"),
++                    response_id=getattr(self, "_current_response_id", None),
+                 )
+                 flushed_ids.add(msg_id)
+             self._last_flushed_db_idx = len(messages)
+diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
+index ac5e29c4d..31c2ef1c1 100644
+--- a/tests/gateway/test_api_server.py
++++ b/tests/gateway/test_api_server.py
+@@ -371,6 +371,54 @@ class TestAdapterInit:
+         assert isinstance(agent, FakeAgent)
+         assert captured["max_iterations"] == 200
+ 
++    def test_create_agent_uses_request_model_override(self, monkeypatch):
++        captured = {}
++
++        class FakeAgent:
++            def __init__(self, **kwargs):
++                captured.update(kwargs)
++
++        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
++        monkeypatch.setattr(
++            "gateway.run._resolve_runtime_agent_kwargs",
++            lambda: {
++                "provider": "openai-codex",
++                "api_key": "sk-default",
++                "base_url": "https://default.test/v1",
++                "api_mode": "codex_responses",
++            },
++        )
++        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "default-model")
++        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
++        monkeypatch.setattr(
++            "gateway.run.GatewayRunner._load_reasoning_config",
++            staticmethod(lambda: {}),
++        )
++        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
++        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
++
++        adapter = APIServerAdapter(PlatformConfig(enabled=True))
++        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
++
++        override = {
++            "model": "gpt-5.5",
++            "provider": "openai",
++            "runtime": {
++                "provider": "openai",
++                "api_key": "sk-request",
++                "base_url": "https://api.openai.com/v1",
++                "api_mode": "codex_responses",
++            },
++        }
++        agent = adapter._create_agent(request_model_override=override)
++
++        assert isinstance(agent, FakeAgent)
++        assert captured["model"] == "gpt-5.5"
++        assert captured["provider"] == "openai"
++        assert captured["api_key"] == "sk-request"
++        assert captured["base_url"] == "https://api.openai.com/v1"
++        assert captured["api_mode"] == "codex_responses"
++
+ 
+ # ---------------------------------------------------------------------------
+ # Auth checking
+@@ -450,6 +498,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
+     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+     app.router.add_post("/v1/responses", adapter._handle_responses)
++    app.router.add_post("/v1/responses/{response_id}/steer", adapter._handle_steer_response)
++    app.router.add_post("/v1/sessions/{session_id}/steer", adapter._handle_steer_session)
+     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
+     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+     return app
+@@ -499,6 +549,96 @@ class TestAgentExecution:
+             task_id="session-123",
+         )
+ 
++    @pytest.mark.asyncio
++    async def test_run_agent_threads_request_model_override_to_create_agent(self, adapter):
++        mock_agent = MagicMock()
++        mock_agent.run_conversation.return_value = {"final_response": "ok"}
++        mock_agent.session_prompt_tokens = 0
++        mock_agent.session_completion_tokens = 0
++        mock_agent.session_total_tokens = 0
++        override = {
++            "model": "gpt-5.5",
++            "provider": "openai",
++            "runtime": {"provider": "openai"},
++        }
++
++        with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create:
++            await adapter._run_agent(
++                user_message="hello",
++                conversation_history=[],
++                request_model_override=override,
++            )
++
++        assert mock_create.call_args.kwargs["request_model_override"] == override
++
++    def test_request_model_override_ignores_model_without_provider(self, adapter):
++        override, err = adapter._resolve_request_model_override({"model": "frontend-model"})
++
++        assert override is None
++        assert err is None
++
++    def test_request_model_override_requires_model_with_provider(self, adapter):
++        override, err = adapter._resolve_request_model_override({"provider": "openai"})
++
++        assert override is None
++        assert err is not None
++        assert err.status == 400
++
++    def test_request_model_override_resolves_provider_and_model(self, adapter, monkeypatch):
++        captured = {}
++
++        class FakeSwitchResult:
++            success = True
++            new_model = "gpt-5.5"
++            target_provider = "openai"
++            api_key = "sk-switch"
++            base_url = "https://api.openai.com/v1"
++            api_mode = "codex_responses"
++            error_message = ""
++
++        def fake_switch_model(**kwargs):
++            captured["switch"] = kwargs
++            return FakeSwitchResult()
++
++        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"providers": {"openai": {}}})
++        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda cfg=None: "default-model")
++        monkeypatch.setattr(
++            "gateway.run._resolve_runtime_agent_kwargs",
++            lambda: {
++                "provider": "openai-codex",
++                "api_key": "sk-default",
++                "base_url": "https://default.test/v1",
++                "api_mode": "codex_responses",
++            },
++        )
++        monkeypatch.setattr("hermes_cli.config.get_compatible_custom_providers", lambda cfg: [])
++        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
++        monkeypatch.setattr(
++            "hermes_cli.runtime_provider.resolve_runtime_provider",
++            lambda requested, target_model: {
++                "provider": requested,
++                "api_key": "sk-runtime",
++                "base_url": "https://runtime.test/v1",
++                "api_mode": "chat_completions",
++                "args": ["--runtime"],
++            },
++        )
++
++        override, err = adapter._resolve_request_model_override(
++            {"provider": "openai", "model": "gpt-5.5"},
++        )
++
++        assert err is None
++        assert override["model"] == "gpt-5.5"
++        assert override["provider"] == "openai"
++        assert override["runtime"]["provider"] == "openai"
++        assert override["runtime"]["api_key"] == "sk-switch"
++        assert override["runtime"]["base_url"] == "https://api.openai.com/v1"
++        assert override["runtime"]["api_mode"] == "codex_responses"
++        assert override["runtime"]["args"] == ["--runtime"]
++        assert captured["switch"]["raw_input"] == "gpt-5.5"
++        assert captured["switch"]["explicit_provider"] == "openai"
++
+ 
+ # ---------------------------------------------------------------------------
+ # /health endpoint
+@@ -1384,6 +1524,39 @@ class TestChatCompletionsEndpoint:
+             assert data["choices"][0]["finish_reason"] == "stop"
+             assert "usage" in data
+ 
++    @pytest.mark.asyncio
++    async def test_chat_completion_provider_model_override_is_request_scoped(self, adapter):
++        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
++        override = {
++            "model": "claude-sonnet-4.6",
++            "provider": "anthropic",
++            "runtime": {"provider": "anthropic"},
++        }
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_resolve_request_model_override", return_value=(override, None)), \
++                 patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
++                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
++                resp = await cli.post(
++                    "/v1/chat/completions",
++                    json={
++                        "provider": "anthropic",
++                        "model": "claude-sonnet-4.6",
++                        "messages": [{"role": "user", "content": "Hello"}],
++                    },
++                )
++
++            assert resp.status == 200
++            data = await resp.json()
++            assert data["model"] == "claude-sonnet-4.6"
++            assert data["hermes"] == {
++                "provider": "anthropic",
++                "model": "claude-sonnet-4.6",
++            }
++            assert mock_run.call_args.kwargs["request_model_override"] == override
++            assert not hasattr(adapter, "_session_model_overrides")
++
+     @pytest.mark.asyncio
+     async def test_system_prompt_extracted(self, adapter):
+         """System messages from the client are passed as ephemeral_system_prompt."""
+@@ -1560,6 +1733,41 @@ class TestDeriveChatSessionId:
+ 
+ 
+ class TestResponsesEndpoint:
++    @pytest.mark.asyncio
++    async def test_response_steer_endpoint_calls_active_agent_steer(self, adapter):
++        agent = MagicMock()
++        agent.steer.return_value = True
++        adapter._active_response_agents["resp_active"] = [agent]
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post("/v1/responses/resp_active/steer", json={"input": "check after tool"})
++            assert resp.status == 200
++            data = await resp.json()
++            assert data == {"object": "response.steer", "accepted": True, "response_id": "resp_active"}
++            agent.steer.assert_called_once_with("check after tool")
++
++    @pytest.mark.asyncio
++    async def test_session_steer_endpoint_calls_active_agent_steer(self, adapter):
++        agent = MagicMock()
++        agent.steer.return_value = True
++        adapter._active_response_agents_by_session["session-active"] = [agent]
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post("/v1/sessions/session-active/steer", json={"input": "use smaller patch"})
++            assert resp.status == 200
++            data = await resp.json()
++            assert data == {"object": "response.steer", "accepted": True, "session_id": "session-active"}
++            agent.steer.assert_called_once_with("use smaller patch")
++
++    @pytest.mark.asyncio
++    async def test_session_steer_endpoint_returns_404_without_active_response(self, adapter):
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post("/v1/sessions/missing/steer", json={"input": "late steer"})
++            assert resp.status == 404
++            data = await resp.json()
++            assert "No active response" in data["error"]["message"]
++
+     @pytest.mark.asyncio
+     async def test_missing_input_returns_400(self, adapter):
+         app = _create_app(adapter)
+@@ -1611,6 +1819,36 @@ class TestResponsesEndpoint:
+             assert data["output"][0]["content"][0]["type"] == "output_text"
+             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+ 
++    @pytest.mark.asyncio
++    async def test_response_provider_model_override_is_request_scoped(self, adapter):
++        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
++        override = {
++            "model": "gpt-5.5",
++            "provider": "openai",
++            "runtime": {"provider": "openai"},
++        }
++
++        app = _create_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_resolve_request_model_override", return_value=(override, None)), \
++                 patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
++                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
++                resp = await cli.post(
++                    "/v1/responses",
++                    json={
++                        "provider": "openai",
++                        "model": "gpt-5.5",
++                        "input": "Hello",
++                    },
++                )
++
++            assert resp.status == 200
++            data = await resp.json()
++            assert data["model"] == "gpt-5.5"
++            assert data["hermes"] == {"provider": "openai", "model": "gpt-5.5"}
++            assert mock_run.call_args.kwargs["request_model_override"] == override
++            assert not hasattr(adapter, "_session_model_overrides")
++
+     @pytest.mark.asyncio
+     async def test_successful_response_with_array_input(self, adapter):
+         """Array input with role/content objects."""
+@@ -2023,7 +2261,20 @@ class TestResponsesStreaming:
+                     cb(" world")
+                 return (
+                     {"final_response": "Hello world", "messages": [], "api_calls": 1},
+-                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
++                    {
++                        "input_tokens": 10,
++                        "output_tokens": 5,
++                        "total_tokens": 15,
++                        "cached_input_tokens": 3,
++                        "api_calls": 2,
++                        "current_context_tokens": 1234,
++                        "context_tokens": 1234,
++                        "last_prompt_tokens": 1234,
++                        "context_length": 2000,
++                        "context_percent": 62,
++                        "compression_count": 1,
++                        "compressions": 1,
++                    },
+                 )
+ 
+             with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+@@ -2042,6 +2293,31 @@ class TestResponsesStreaming:
+                 assert '"logprobs": []' in body
+                 assert "Hello" in body
+                 assert " world" in body
++                completed_payload = None
++                for line in body.splitlines():
++                    if not line.startswith("data: "):
++                        continue
++                    try:
++                        payload = json.loads(line[len("data: "):])
++                    except json.JSONDecodeError:
++                        continue
++                    if payload.get("type") == "response.completed":
++                        completed_payload = payload
++                        break
++                assert completed_payload is not None
++                usage = completed_payload["response"]["usage"]
++                assert usage["input_tokens"] == 10
++                assert usage["output_tokens"] == 5
++                assert usage["total_tokens"] == 15
++                assert usage["cached_input_tokens"] == 3
++                assert usage["api_calls"] == 2
++                assert usage["current_context_tokens"] == 1234
++                assert usage["context_tokens"] == 1234
++                assert usage["last_prompt_tokens"] == 1234
++                assert usage["context_length"] == 2000
++                assert usage["context_percent"] == 62
++                assert usage["compression_count"] == 1
++                assert usage["compressions"] == 1
+ 
+     @pytest.mark.asyncio
+     async def test_stream_string_false_returns_json_response(self, adapter):
+diff --git a/tests/gateway/test_api_server_audio_transcriptions.py b/tests/gateway/test_api_server_audio_transcriptions.py
+new file mode 100644
+index 000000000..6c88b2c95
+--- /dev/null
++++ b/tests/gateway/test_api_server_audio_transcriptions.py
+@@ -0,0 +1,67 @@
++"""Tests for the API server audio transcription endpoint."""
++
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestClient, TestServer
++
++from gateway.config import PlatformConfig
++from gateway.platforms.api_server import APIServerAdapter
++
++
++def _create_app(adapter: APIServerAdapter) -> web.Application:
++    app = web.Application()
++    app["api_server_adapter"] = adapter
++    app.router.add_post("/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
++    return app
++
++
++@pytest.mark.asyncio
++async def test_audio_transcription_uploads_raw_audio_to_stt_tool():
++    adapter = APIServerAdapter(PlatformConfig(enabled=True))
++    captured: dict[str, str] = {}
++
++    def fake_transcribe(path: str):
++        captured["path"] = path
++        assert Path(path).exists()
++        assert Path(path).read_bytes() == b"webm audio"
++        return {"success": True, "transcript": "hello world", "provider": "openai"}
++
++    app = _create_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        with patch("tools.transcription_tools.transcribe_audio", side_effect=fake_transcribe):
++            resp = await cli.post(
++                "/v1/audio/transcriptions",
++                data=b"webm audio",
++                headers={"Content-Type": "audio/webm"},
++            )
++            assert resp.status == 200, await resp.text()
++            body = await resp.json()
++
++    assert body == {
++        "object": "audio.transcription",
++        "text": "hello world",
++        "transcript": "hello world",
++        "provider": "openai",
++    }
++    assert captured["path"].endswith(".webm")
++    assert not Path(captured["path"]).exists()
++
++
++@pytest.mark.asyncio
++async def test_audio_transcription_rejects_non_audio_payload():
++    adapter = APIServerAdapter(PlatformConfig(enabled=True))
++    app = _create_app(adapter)
++
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post(
++            "/v1/audio/transcriptions",
++            data=b"not audio",
++            headers={"Content-Type": "text/plain"},
++        )
++        assert resp.status == 400
++        body = await resp.json()
++
++    assert body["error"]["code"] == "invalid_audio_type"
+diff --git a/tests/gateway/test_api_server_multimodal.py b/tests/gateway/test_api_server_multimodal.py
+index 299a05030..0685213b3 100644
+--- a/tests/gateway/test_api_server_multimodal.py
++++ b/tests/gateway/test_api_server_multimodal.py
+@@ -247,6 +247,85 @@ class TestChatCompletionsMultimodalHTTP:
+         assert body["error"]["code"] == "unsupported_content_type"
+ 
+ 
++class TestResponsesForceCompactionHTTP:
++    @pytest.mark.asyncio
++    async def test_force_compaction_without_input_compacts_previous_response_history(self, adapter):
++        app = _create_app(adapter)
++        adapter._response_store.put("resp_prev", {
++            "response": {"id": "resp_prev", "object": "response", "status": "completed"},
++            "conversation_history": [
++                {"role": "user", "content": "one"},
++                {"role": "assistant", "content": "two"},
++                {"role": "user", "content": "three"},
++                {"role": "assistant", "content": "four"},
++            ],
++            "instructions": "stay helpful",
++            "session_id": "session-prev",
++        })
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_compact_response_context", new=MagicMock()) as mock_compact:
++                async def _stub(**kwargs):
++                    mock_compact.captured = kwargs
++                    return (
++                        [{"role": "user", "content": "[CONTEXT COMPACTION]\nsummary"}],
++                        {"input_tokens": 10, "output_tokens": 0, "total_tokens": 10, "compression_count": 1},
++                        "session-prev",
++                    )
++                mock_compact.side_effect = _stub
++
++                resp = await cli.post(
++                    "/v1/responses",
++                    json={
++                        "model": "hermes-agent",
++                        "previous_response_id": "resp_prev",
++                        "force_compaction": True,
++                        "compaction_focus": "schema notes",
++                    },
++                )
++                assert resp.status == 200, await resp.text()
++                body = await resp.json()
++
++        assert body["output"][0]["content"][0]["text"].startswith("[CONTEXT COMPACTION]")
++        assert mock_compact.captured["ephemeral_system_prompt"] == "stay helpful"
++        assert mock_compact.captured["focus_topic"] == "schema notes"
++        stored = adapter._response_store.get(body["id"])
++        assert stored["conversation_history"] == [
++            {"role": "user", "content": "[CONTEXT COMPACTION]\nsummary"},
++        ]
++
++    @pytest.mark.asyncio
++    async def test_compaction_forwards_request_model_override_to_agent_factory(self, adapter):
++        fake_agent = MagicMock()
++        fake_agent.compression_enabled = True
++        fake_agent._cached_system_prompt = ""
++        fake_agent.tools = None
++        fake_agent.session_id = "session-prev"
++        fake_agent._compress_context.return_value = ([{"role": "user", "content": "summary"}], None)
++        request_model_override = {
++            "provider": "custom:test",
++            "model": "test-model",
++            "runtime": {"provider": "custom:test", "base_url": "https://example.invalid/v1"},
++        }
++
++        with patch.object(adapter, "_create_agent", return_value=fake_agent) as create_agent:
++            with patch.object(adapter, "_agent_usage_snapshot", return_value={}):
++                compacted, _, effective_session_id = await adapter._compact_response_context(
++                    conversation_history=[
++                        {"role": "user", "content": "one"},
++                        {"role": "assistant", "content": "two"},
++                        {"role": "user", "content": "three"},
++                        {"role": "assistant", "content": "four"},
++                    ],
++                    session_id="session-prev",
++                    request_model_override=request_model_override,
++                )
++
++        assert compacted == [{"role": "user", "content": "summary"}]
++        assert effective_session_id == "session-prev"
++        create_agent.assert_called_once()
++        assert create_agent.call_args.kwargs["request_model_override"] is request_model_override
++
++
+ class TestResponsesMultimodalHTTP:
+     @pytest.mark.asyncio
+     async def test_input_image_canonicalized_and_forwarded(self, adapter):
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index d6e1e5885..51a7a9e53 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -124,6 +124,41 @@ class TestStartRun:
+                 assert status["status"] in {"queued", "running", "completed"}
+                 assert status["object"] == "hermes.run"
+ 
++    @pytest.mark.asyncio
++    async def test_start_records_durable_run_lifecycle_events(self, adapter):
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent") as mock_create, \
++                 patch.object(adapter, "_record_run_session_event") as mock_record:
++                mock_agent = MagicMock()
++                mock_agent.run_conversation.return_value = {"final_response": "done"}
++                mock_agent.session_prompt_tokens = 0
++                mock_agent.session_completion_tokens = 0
++                mock_agent.session_total_tokens = 0
++                mock_create.return_value = mock_agent
++
++                resp = await cli.post(
++                    "/v1/runs",
++                    json={"input": "hello", "session_id": "nako:test:run-lifecycle"},
++                )
++                assert resp.status == 202
++                data = await resp.json()
++
++                for _ in range(20):
++                    status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
++                    status = await status_resp.json()
++                    if status["status"] == "completed":
++                        break
++                    await asyncio.sleep(0.05)
++
++                event_types = [
++                    call.kwargs["event_type"]
++                    for call in mock_record.call_args_list
++                ]
++                assert "run.started" in event_types
++                assert "run.running" in event_types
++                assert "run.completed" in event_types
++
+     @pytest.mark.asyncio
+     async def test_start_invalid_json_returns_400(self, adapter):
+         app = _create_runs_app(adapter)
+@@ -189,6 +224,42 @@ class TestStartRun:
+                 )
+                 assert resp.status == 202
+ 
++    @pytest.mark.asyncio
++    async def test_start_threads_request_model_override_to_create_agent(self, adapter):
++        override = {
++            "model": "gpt-5.5",
++            "provider": "openai-codex",
++            "runtime": {"provider": "openai-codex"},
++        }
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_resolve_request_model_override", return_value=(override, None)), \
++                 patch.object(adapter, "_create_agent") as mock_create:
++                mock_agent = MagicMock()
++                mock_agent.run_conversation.return_value = {"final_response": "done"}
++                mock_agent.session_prompt_tokens = 0
++                mock_agent.session_completion_tokens = 0
++                mock_agent.session_total_tokens = 0
++                mock_create.return_value = mock_agent
++
++                resp = await cli.post(
++                    "/v1/runs",
++                    json={"input": "hello", "model": "gpt-5.5", "provider": "openai-codex"},
++                )
++                assert resp.status == 202
++                data = await resp.json()
++
++                for _ in range(20):
++                    if mock_create.called:
++                        break
++                    await asyncio.sleep(0.05)
++
++                assert mock_create.called
++                assert mock_create.call_args.kwargs["request_model_override"] == override
++                status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
++                status = await status_resp.json()
++                assert status["model"] == "gpt-5.5"
++
+ 
+ # ---------------------------------------------------------------------------
+ # GET /v1/runs/{run_id} — poll run status
+diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
+index 47f7b38ee..c1a78c4c1 100644
+--- a/tests/gateway/test_session_api.py
++++ b/tests/gateway/test_session_api.py
+@@ -1,5 +1,6 @@
+ """Focused tests for API server session-control endpoints."""
+ 
++import asyncio
+ from unittest.mock import AsyncMock, patch
+ 
+ import pytest
+@@ -7,7 +8,7 @@ from aiohttp import web
+ from aiohttp.test_utils import TestClient, TestServer
+ 
+ from gateway.config import PlatformConfig
+-from gateway.platforms.api_server import APIServerAdapter
++from gateway.platforms.api_server import APIServerAdapter, ResponseStore
+ from hermes_state import SessionDB
+ 
+ 
+@@ -23,34 +24,69 @@ def session_db(tmp_path):
+ 
+ 
+ @pytest.fixture
+-def adapter(session_db):
++def adapter(session_db, tmp_path):
+     adapter = APIServerAdapter(PlatformConfig(enabled=True))
++    adapter._response_store.close()
++    adapter._response_store = ResponseStore(db_path=str(tmp_path / "response_store.db"))
+     adapter._session_db = session_db
+-    return adapter
++    try:
++        yield adapter
++    finally:
++        adapter._response_store.close()
+ 
+ 
+ @pytest.fixture
+-def auth_adapter(session_db):
++def auth_adapter(session_db, tmp_path):
+     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
++    adapter._response_store.close()
++    adapter._response_store = ResponseStore(db_path=str(tmp_path / "response_store.db"))
+     adapter._session_db = session_db
+-    return adapter
++    try:
++        yield adapter
++    finally:
++        adapter._response_store.close()
+ 
+ 
+ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
+     app = web.Application()
+     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
++    app.router.add_post("/v1/runs", adapter._handle_runs)
++    app.router.add_get("/v1/sessions/active", adapter._handle_list_active_sessions)
++    app.router.add_get("/v1/sessions/{session_id}/state", adapter._handle_session_state)
++    app.router.add_get("/v1/sessions/{session_id}/items", adapter._handle_session_items)
++    app.router.add_get("/v1/sessions/{session_id}/events", adapter._handle_session_events)
++    app.router.add_get("/v1/session_events/firehose", adapter._handle_session_firehose)
++    app.router.add_post("/v1/session_events/ack", adapter._handle_session_events_ack)
+     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
+     app.router.add_post("/api/sessions", adapter._handle_create_session)
+     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
+     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
+     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
+     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
++    app.router.add_get("/api/sessions/{session_id}/active-run", adapter._handle_session_active_run)
++    app.router.add_get("/api/session-runs/{run_id}/events", adapter._handle_session_run_events)
+     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
++    app.router.add_post("/v1/sessions/{session_id}/steer", adapter._handle_steer_session)
++    app.router.add_post("/v1/sessions/{session_id}/halt", adapter._handle_halt_session)
++    app.router.add_post("/v1/sessions/{session_id}/queue", adapter._handle_queue_session)
+     return app
+ 
+ 
++class _CaptureAgent:
++    def __init__(self):
++        self.call = None
++
++    def run_conversation(self, user_message, conversation_history=None, task_id=None):
++        self.call = {
++            "user_message": user_message,
++            "conversation_history": conversation_history,
++            "task_id": task_id,
++        }
++        return {"final_response": "ok", "messages": []}
++
++
+ @pytest.mark.asyncio
+ async def test_capabilities_advertises_session_control_surface(adapter):
+     app = _create_session_app(adapter)
+@@ -63,6 +99,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+     assert features["session_resources"] is True
+     assert features["session_chat"] is True
+     assert features["session_chat_streaming"] is True
++    assert features["session_run_replay"] is True
+     assert features["session_fork"] is True
+     assert features["admin_config_rw"] is False
+     assert features["memory_write_api"] is False
+@@ -73,6 +110,14 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+         "method": "POST",
+         "path": "/api/sessions/{session_id}/chat/stream",
+     }
++    assert data["endpoints"]["session_active_run"] == {
++        "method": "GET",
++        "path": "/api/sessions/{session_id}/active-run",
++    }
++    assert data["endpoints"]["session_run_events"] == {
++        "method": "GET",
++        "path": "/api/session-runs/{run_id}/events",
++    }
+ 
+ 
+ @pytest.mark.asyncio
+@@ -123,6 +168,14 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
+     }
+ 
+ 
++@pytest.mark.asyncio
++async def test_query_access_token_auth_supports_websocket_clients(auth_adapter):
++    app = _create_session_app(auth_adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.get("/v1/capabilities?access_token=sk-test")
++        assert resp.status == 200
++
++
+ @pytest.mark.asyncio
+ async def test_session_crud_and_message_history(adapter, session_db):
+     app = _create_session_app(adapter)
+@@ -156,6 +209,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert messages["object"] == "list"
+         assert [m["role"] for m in messages["data"]] == ["user", "assistant"]
+         assert messages["data"][0]["content"] == "hello from phone"
++        assert messages["data"][0]["items"][0]["id"].startswith("msg:")
+ 
+         patch_resp = await cli.patch(f"/api/sessions/{session_id}", json={"title": "Renamed"})
+         assert patch_resp.status == 200
+@@ -189,6 +243,42 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
+     assert [m["content"] for m in messages["data"]] == ["after compression"]
+ 
+ 
++@pytest.mark.asyncio
++async def test_runs_hydrate_existing_session_history(adapter, session_db):
++    session_id = session_db.create_session("continuity-session", "api_server")
++    session_db.append_message(session_id, "user", "terminal twice")
++    session_db.append_message(session_id, "assistant", "Ran terminal twice.")
++    agent = _CaptureAgent()
++
++    app = _create_session_app(adapter)
++    with (
++        patch.object(adapter, "_create_agent", return_value=agent),
++        patch.object(adapter, "_agent_usage_snapshot", return_value={}),
++    ):
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                "/v1/runs",
++                json={"session_id": session_id, "input": "before that", "model": "test-model"},
++            )
++            assert resp.status == 202, await resp.text()
++            for _ in range(50):
++                if agent.call is not None:
++                    break
++                await asyncio.sleep(0.02)
++
++    assert agent.call is not None
++    assert agent.call["user_message"] == "before that"
++    assert agent.call["task_id"] == session_id
++    history = agent.call["conversation_history"]
++    assert len(history) == 2
++    assert isinstance(history[0].pop("timestamp"), (int, float))
++    assert isinstance(history[1].pop("timestamp"), (int, float))
++    assert history == [
++        {"role": "user", "content": "terminal twice"},
++        {"role": "assistant", "content": "Ran terminal twice."},
++    ]
++
++
+ @pytest.mark.asyncio
+ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
+     source_id = session_db.create_session("source-session", "api_server", model="test-model")
+@@ -278,6 +368,164 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
+     assert kwargs["user_message"] == expected_user_message
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_replay_api_exposes_stable_items_events_and_state(adapter, session_db):
++    session_id = session_db.create_session("sync-session", "api_server")
++    session_db.append_message(session_id, "user", "please inspect")
++    session_db.append_message(
++        session_id,
++        "assistant",
++        "",
++        tool_calls=[{"id": "call_1", "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}],
++    )
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        items_resp = await cli.get(f"/v1/sessions/{session_id}/items")
++        assert items_resp.status == 200
++        items_payload = await items_resp.json()
++        item_ids = [item["id"] for item in items_payload["data"]]
++        assert item_ids[0].startswith("msg:")
++        assert any(item_id.endswith(":tool_call:call_1") for item_id in item_ids)
++        assert items_payload["latest_event_cursor"] is not None
++
++        events_resp = await cli.get(f"/v1/sessions/{session_id}/events?after=0")
++        assert events_resp.status == 200
++        events_payload = await events_resp.json()
++        assert events_payload["object"] == "list"
++        assert all(event["event_id"].startswith("evt:") for event in events_payload["data"])
++        assert [event["event_type"] for event in events_payload["data"]].count("session.item.upserted") >= 2
++        cursor = events_payload["data"][0]["cursor"]
++
++        replay_resp = await cli.get(f"/v1/sessions/{session_id}/events?after={cursor}")
++        assert replay_resp.status == 200
++        replay_payload = await replay_resp.json()
++        assert all(int(event["cursor"]) > int(cursor) for event in replay_payload["data"])
++
++        state_resp = await cli.get(f"/v1/sessions/{session_id}/state")
++        assert state_resp.status == 200
++        state_payload = await state_resp.json()
++        assert state_payload["state"] == "interrupted"
++        assert state_payload["pending_tool_call_ids"] == ["call_1"]
++
++        active_resp = await cli.get("/v1/sessions/active")
++        assert active_resp.status == 200
++        active_payload = await active_resp.json()
++        listed = {session["id"]: session for session in active_payload["data"]}
++        assert listed[session_id]["sync_state"]["state"] == "interrupted"
++
++
++@pytest.mark.asyncio
++async def test_session_state_and_firehose_include_run_terminal_events(adapter, session_db):
++    session_id = session_db.create_session("run-terminal-session", "api_server")
++    adapter._set_run_status("run_test", "running", session_id=session_id)
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        state_resp = await cli.get(f"/v1/sessions/{session_id}/state")
++        assert state_resp.status == 200
++        state_payload = await state_resp.json()
++        assert state_payload["state"] == "processing"
++        assert state_payload["active"] is True
++
++        cursor = session_db.latest_session_event_cursor(session_id) or "0"
++        adapter._record_run_session_event(
++            session_id=session_id,
++            event_type="run.completed",
++            run_id="run_test",
++            payload={"status": "completed", "output": "done"},
++        )
++
++        events_resp = await cli.get(f"/v1/sessions/{session_id}/events?after={cursor}")
++        assert events_resp.status == 200
++        events_payload = await events_resp.json()
++
++    terminal_event = events_payload["data"][0]
++    assert terminal_event["event_id"].startswith("evt:")
++    assert terminal_event["event_type"] == "run.completed"
++    assert terminal_event["item_id"] == "run:run_test"
++    assert terminal_event["payload"]["run_id"] == "run_test"
++    assert terminal_event["payload"]["status"] == "completed"
++
++
++@pytest.mark.asyncio
++async def test_session_firehose_streams_missed_events(adapter, session_db):
++    session_id = session_db.create_session("firehose-session", "api_server")
++    cursor = session_db.latest_session_event_cursor() or "0"
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        ws = await cli.ws_connect(f"/v1/session_events/firehose?after={cursor}")
++        session_db.append_message(session_id, "user", "from firehose")
++        try:
++            message = await asyncio.wait_for(ws.receive(), timeout=3)
++            assert message.type == web.WSMsgType.TEXT
++            payload = message.json()
++            assert payload["session_id"] == session_id
++            assert payload["event_type"] == "session.item.upserted"
++            assert payload["payload"]["item"]["id"].startswith("msg:")
++        finally:
++            await ws.close()
++
++
++@pytest.mark.asyncio
++async def test_session_events_ack_records_monotonic_consumer_offset(adapter, session_db):
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post("/v1/session_events/ack", json={"consumer": "nako", "cursor": "7"})
++        assert resp.status == 200
++        body = await resp.json()
++        assert body["object"] == "hermes.session_events.ack"
++        assert body["consumer"] == "nako"
++        assert body["cursor"] == "7"
++
++        # Idempotent + monotonic: a lower/equal ack must never rewind the offset.
++        resp = await cli.post("/v1/session_events/ack", json={"consumer": "nako", "cursor": "3"})
++        assert (await resp.json())["cursor"] == "7"
++
++        # A newer ack advances it.
++        resp = await cli.post("/v1/session_events/ack", json={"consumer": "nako", "cursor": "9"})
++        assert (await resp.json())["cursor"] == "9"
++
++    assert session_db.get_consumer_offset("nako") == "9"
++    assert session_db.get_consumer_offset("other") is None
++
++
++@pytest.mark.asyncio
++async def test_session_events_ack_validates_body(adapter):
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post("/v1/session_events/ack", json={"cursor": "1"})
++        assert resp.status == 400
++        resp = await cli.post("/v1/session_events/ack", json={"consumer": "nako"})
++        assert resp.status == 400
++        resp = await cli.post("/v1/session_events/ack", data="not-json")
++        assert resp.status == 400
++
++
++@pytest.mark.asyncio
++async def test_session_firehose_resumes_from_consumer_offset(adapter, session_db):
++    session_id = session_db.create_session("firehose-consumer-session", "api_server")
++    # One event already exists and nako has durably acknowledged it.
++    session_db.append_message(session_id, "user", "first")
++    first_cursor = session_db.latest_session_event_cursor()
++    session_db.acknowledge_consumer_offset("nako", first_cursor)
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        # No explicit `after`: the firehose must resume from nako's acked offset,
++        # skip the already-stored event, and replay only the newer one.
++        ws = await cli.ws_connect("/v1/session_events/firehose?consumer=nako")
++        session_db.append_message(session_id, "assistant", "second")
++        try:
++            message = await asyncio.wait_for(ws.receive(), timeout=3)
++            assert message.type == web.WSMsgType.TEXT
++            payload = message.json()
++            assert int(payload["cursor"]) > int(first_cursor)
++        finally:
++            await ws.close()
++
++
+ @pytest.mark.asyncio
+ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
+     session_id = session_db.create_session("image-stream-session", "api_server")
+@@ -340,6 +588,214 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
+     assert "event: done" in body
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_chat_stream_forwards_model_override_and_records_live_tool_items(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("stream-tool-session", "api_server")
++    captured_kwargs = {}
++
++    async def fake_run(**kwargs):
++        captured_kwargs.update(kwargs)
++        assert adapter._active_response_agents_by_session.get(session_id) is kwargs["agent_ref"]
++        kwargs["tool_start_callback"]("call_1", "terminal", {"cmd": "pwd"})
++        kwargs["tool_complete_callback"]("call_1", "terminal", {"cmd": "pwd"}, "/Users/quill")
++        return {
++            "final_response": "done",
++            "session_id": session_id,
++            "messages": [{"role": "assistant", "content": "done"}],
++        }, {"total_tokens": 2}
++
++    app = _create_session_app(adapter)
++    with (
++        patch.object(
++            adapter,
++            "_resolve_request_model_override",
++            return_value=({"model": "gpt-5.5", "provider": "openai-codex"}, None),
++        ),
++        patch.object(adapter, "_run_agent", side_effect=fake_run),
++    ):
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(
++                f"/api/sessions/{session_id}/chat/stream",
++                json={
++                    "provider": "openai-codex",
++                    "model": "gpt-5.5",
++                    "message": "use a tool",
++                },
++            )
++            assert resp.status == 200
++            body = await resp.text()
++
++    assert captured_kwargs["request_model_override"]["model"] == "gpt-5.5"
++    run_id = None
++    for block in body.split("\n\n"):
++        if "event: run.started" in block:
++            for line in block.splitlines():
++                if line.startswith("data: "):
++                    run_id = _json.loads(line[len("data: "):])["run_id"]
++            break
++    assert run_id is not None, body
++    events = session_db.list_session_events(session_id, after=0)
++    live_tool_events = [
++        event
++        for event in events
++        if event["event_type"] == "session.item.upserted"
++        and event.get("response_id") == run_id
++    ]
++    assert len(live_tool_events) == 2
++    item_types = [event["payload"]["item"]["type"] for event in live_tool_events]
++    assert item_types == ["tool_call", "tool_result"]
++    assert session_id not in adapter._active_response_agents_by_session
++
++
++@pytest.mark.asyncio
++async def test_session_halt_interrupts_active_chat_stream_agent(adapter, session_db):
++    session_id = session_db.create_session("halt-stream-session", "api_server")
++
++    class Agent:
++        def __init__(self):
++            self.reason = None
++
++        def interrupt(self, reason):
++            self.reason = reason
++
++    agent = Agent()
++    adapter._active_response_agents_by_session[session_id] = [agent]
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post(
++            f"/v1/sessions/{session_id}/halt",
++            json={"reason": "user stopped it"},
++        )
++        assert resp.status == 200
++        body = await resp.json()
++
++    assert body["accepted"] is True
++    assert body["session_id"] == session_id
++    assert agent.reason == "user stopped it"
++
++
++@pytest.mark.asyncio
++async def test_session_queue_drains_after_active_chat_stream_turn(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("queue-stream-session", "api_server")
++    first_turn_started = asyncio.Event()
++    release_first_turn = asyncio.Event()
++    seen_messages = []
++
++    async def fake_run(**kwargs):
++        seen_messages.append(kwargs["user_message"])
++        if len(seen_messages) == 1:
++            first_turn_started.set()
++            await release_first_turn.wait()
++        return {
++            "final_response": f"done {len(seen_messages)}",
++            "session_id": session_id,
++            "messages": [{"role": "assistant", "content": f"done {len(seen_messages)}"}],
++        }, {"total_tokens": len(seen_messages)}
++
++    app = _create_session_app(adapter)
++    with patch.object(adapter, "_run_agent", side_effect=fake_run):
++        async with TestClient(TestServer(app)) as cli:
++            stream_task = asyncio.create_task(
++                cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "first"})
++            )
++            await asyncio.wait_for(first_turn_started.wait(), timeout=2)
++            queue_resp = await cli.post(
++                f"/v1/sessions/{session_id}/queue",
++                json={"input": [{"role": "user", "content": "second"}]},
++            )
++            assert queue_resp.status == 202, await queue_resp.text()
++            queued = await queue_resp.json()
++            release_first_turn.set()
++            stream_resp = await stream_task
++            assert stream_resp.status == 200
++            stream_body = await stream_resp.text()
++
++    assert seen_messages == ["first", "second"]
++    run_started_payloads = []
++    for block in stream_body.split("\n\n"):
++        if "event: run.started" not in block:
++            continue
++        for line in block.splitlines():
++            if line.startswith("data: "):
++                run_started_payloads.append(_json.loads(line[len("data: "):]))
++    assert len(run_started_payloads) == 2
++    assert run_started_payloads[1]["run_id"] == queued["run_id"]
++    assert run_started_payloads[1]["user_message"]["content"] == "second"
++
++
++@pytest.mark.asyncio
++async def test_session_chat_stream_persists_replayable_run_state(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("durable-stream-session", "api_server")
++
++    async def fake_run(**kwargs):
++        kwargs["stream_delta_callback"]("Hello")
++        kwargs["tool_progress_callback"]("reasoning.available", tool_name="_thinking", preview="thinking")
++        kwargs["stream_delta_callback"](" world")
++        return {"final_response": "Hello world", "session_id": session_id}, {"total_tokens": 2}
++
++    app = _create_session_app(adapter)
++    with patch.object(adapter, "_run_agent", side_effect=fake_run):
++        async with TestClient(TestServer(app)) as cli:
++            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "stream please"})
++            assert resp.status == 200
++            body = await resp.text()
++
++            active_resp = await cli.get(f"/api/sessions/{session_id}/active-run")
++            assert active_resp.status == 200
++            active = await active_resp.json()
++
++            run = active["run"]
++            run_id = run["run_id"]
++            replay_resp = await cli.get(f"/api/session-runs/{run_id}/events?after=0")
++            assert replay_resp.status == 200
++            replay_body = await replay_resp.text()
++
++    assert run["session_id"] == session_id
++    assert run["status"] == "completed"
++    assert run["user_message"] == "stream please"
++    assert run["draft"] == "Hello world"
++    assert run["reasoning"] == "thinking"
++    assert run["last_seq"] >= 7
++
++    assert "event: run.started" in replay_body
++    assert "event: assistant.delta" in replay_body
++    assert "event: run.completed" in replay_body
++    assert "event: done" in replay_body
++
++    replay_payloads = []
++    for block in replay_body.split("\n\n"):
++        data_line = next((line for line in block.splitlines() if line.startswith("data: ")), None)
++        if data_line:
++            replay_payloads.append(_json.loads(data_line[len("data: "):]))
++    assert [payload["seq"] for payload in replay_payloads] == sorted(payload["seq"] for payload in replay_payloads)
++    assert run_id in body
++
++
++def test_response_store_marks_incomplete_session_runs_interrupted_after_restart(tmp_path):
++    db_path = tmp_path / "response_store.db"
++    store = ResponseStore(db_path=str(db_path))
++    store.create_session_run("run_pending", "session-1", "hello")
++    store.put_session_run_event("run_pending", "run.started", {})
++    assert store.get_session_run("run_pending")["status"] == "running"
++    store.close()
++
++    restarted_store = ResponseStore(db_path=str(db_path))
++    try:
++        run = restarted_store.get_session_run("run_pending")
++        assert run["status"] == "interrupted"
++        assert "restarted" in run["error"]
++        events = restarted_store.list_session_run_events("run_pending")
++        assert [event["event"] for event in events] == ["run.started"]
++    finally:
++        restarted_store.close()
++
++
+ @pytest.mark.asyncio
+ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
+     """run.completed must include the full interleaved turn transcript so a
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index 1d727132a..7620b43fc 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -612,6 +612,63 @@ class TestMessageStorage:
+         messages = db.get_messages("s1")
+         assert messages[0]["tool_calls"] == tool_calls
+ 
++    def test_session_events_expose_stable_item_ids_and_cursors(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.append_message("s1", role="user", content="Hello")
++        db.append_message(
++            "s1",
++            role="assistant",
++            content="",
++            tool_calls=[{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}],
++        )
++        db.append_message(
++            "s1",
++            role="tool",
++            content="result",
++            tool_name="web_search",
++            tool_call_id="call_1",
++        )
++
++        items = db.get_session_items("s1")
++        assert [item["type"] for item in items] == ["message", "tool_call", "tool_result"]
++        assert items[0]["id"].startswith("msg:")
++        assert items[1]["id"].endswith(":tool_call:call_1")
++        assert items[2]["id"].endswith(":tool_result:call_1")
++
++        events = db.list_session_events("s1", after=0)
++        assert [event["event_type"] for event in events] == [
++            "session.item.upserted",
++            "session.item.upserted",
++            "session.item.upserted",
++        ]
++        assert all(event["event_id"] == f"evt:{event['id']}" for event in events)
++        assert all(event["cursor"] == str(event["id"]) for event in events)
++
++        replayed = db.list_session_events("s1", after=events[0]["cursor"])
++        assert [event["id"] for event in replayed] == [events[1]["id"], events[2]["id"]]
++
++    def test_session_state_marks_unresolved_tool_call_interrupted(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.append_message(
++            "s1",
++            role="assistant",
++            content="",
++            tool_calls=[{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}],
++        )
++
++        state = db.get_session_sync_state("s1")
++        assert state["state"] == "interrupted"
++        assert state["pending_tool_call_ids"] == ["call_1"]
++
++        db.append_message(
++            "s1",
++            role="tool",
++            content="result",
++            tool_name="web_search",
++            tool_call_id="call_1",
++        )
++        assert db.get_session_sync_state("s1")["state"] == "idle"
++
+     def test_multimodal_list_content_round_trip(self, db):
+         """Multimodal ``content`` (list of parts) must survive the SQLite
+         round-trip.  sqlite3 cannot bind Python lists directly, so the DB
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 432e02846..64c4db058 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -380,6 +380,63 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
+     assert "result_text" not in events[1][2]
+ 
+ 
++def test_tool_callbacks_append_live_session_item_events(monkeypatch):
++    appended: list[tuple[str, str, dict, str | None]] = []
++
++    class FakeDB:
++        def append_session_event(
++            self, session_id, event_type, payload, *, item_id=None, response_id=None
++        ):
++            appended.append((session_id, event_type, payload, item_id))
++
++    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
++    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
++    monkeypatch.setitem(
++        server._sessions,
++        "live-test",
++        {
++            "session_key": "session-key",
++            "active_response_id": "resp-live",
++            "tool_progress_mode": "none",
++        },
++    )
++
++    server._on_tool_start("live-test", "call-1", "terminal", {"command": "pwd"})
++    server._on_tool_complete(
++        "live-test",
++        "call-1",
++        "terminal",
++        {"command": "pwd"},
++        "done",
++    )
++
++    assert [event[1] for event in appended] == [
++        "session.item.upserted",
++        "session.item.upserted",
++    ]
++    assert appended[0][0] == "session-key"
++    assert appended[0][3] == "live:tool_call:call-1"
++    assert appended[0][2]["item"] == {
++        "id": "live:tool_call:call-1",
++        "object": "hermes.session.item",
++        "type": "tool_call",
++        "session_id": "session-key",
++        "created_at": appended[0][2]["item"]["created_at"],
++        "committed_at": None,
++        "response_id": "resp-live",
++        "tool_call_id": "call-1",
++        "tool_name": "terminal",
++        "role": "assistant",
++        "tool_arguments": '{"command": "pwd"}',
++    }
++    assert appended[0][2]["item"]["response_id"] == "resp-live"
++    assert appended[1][3] == "live:tool_result:call-1"
++    assert appended[1][2]["item"]["response_id"] == "resp-live"
++    assert appended[1][2]["item"]["type"] == "tool_result"
++    assert appended[1][2]["item"]["tool_call_id"] == "call-1"
++    assert appended[1][2]["item"]["content"] == "done"
++
++
+ def test_dispatch_rejects_non_object_request():
+     resp = server.dispatch([])
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 7f7109d10..b37b1bb8e 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2837,6 +2837,61 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
+     return f"{text}{suffix}" if text else None
+ 
+ 
++def _live_tool_arguments(args: dict) -> str:
++    try:
++        return json.dumps(args or {}, sort_keys=True, default=str)
++    except Exception:
++        return "{}"
++
++
++def _append_live_tool_session_item(
++    sid: str,
++    *,
++    item_type: str,
++    tool_call_id: str,
++    name: str,
++    args: dict,
++    content: str | None = None,
++) -> None:
++    session = _sessions.get(sid)
++    if session is None:
++        return
++    db = _get_db()
++    if db is None:
++        return
++    session_id = str(session.get("session_key") or sid)
++    response_id = str(session.get("active_response_id") or "")
++    now = time.time()
++    item: dict[str, object] = {
++        "id": f"live:{item_type}:{tool_call_id}",
++        "object": "hermes.session.item",
++        "type": item_type,
++        "session_id": session_id,
++        "created_at": now,
++        "committed_at": None,
++        "tool_call_id": tool_call_id,
++        "tool_name": name,
++    }
++    if response_id:
++        item["response_id"] = response_id
++    if item_type == "tool_call":
++        item["role"] = "assistant"
++        item["tool_arguments"] = _live_tool_arguments(args)
++    else:
++        item["role"] = "tool"
++        item["content"] = content or ""
++    try:
++        db.append_session_event(
++            session_id,
++            "session.item.upserted",
++            {"item": item},
++            item_id=str(item["id"]),
++            response_id=response_id or None,
++        )
++    except Exception:
++        logger.debug("failed to append live tool session item", exc_info=True)
++
++
+ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
+     session = _sessions.get(sid)
+     if session is not None:
+@@ -2849,6 +2904,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
+         except Exception:
+             pass
+         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
++    _append_live_tool_session_item(
++        sid,
++        item_type="tool_call",
++        tool_call_id=tool_call_id,
++        name=name,
++        args=args,
++    )
+     if _tool_progress_enabled(sid):
+         payload = {
+             "tool_id": tool_call_id,
+@@ -2879,6 +2941,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
+         payload["result"] = json.loads(result)
+     except Exception:
+         payload["result"] = result
++    _append_live_tool_session_item(
++        sid,
++        item_type="tool_result",
++        tool_call_id=tool_call_id,
++        name=name,
++        args=args,
++        content=result,
++    )
+     summary = _tool_summary(name, result, duration_s)
+     if summary:
+         payload["summary"] = summary
+@@ -6367,7 +6437,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+         session["attached_images"] = []
+         if not isinstance(session.get("inflight_turn"), dict):
+             _start_inflight_turn(session, text)
++        response_id = f"tui-turn:{uuid.uuid4().hex}"
++        session["active_response_id"] = response_id
+     agent = session["agent"]
++    try:
++        setattr(agent, "_current_response_id", response_id)
++    except Exception:
++        pass
+     _emit("message.start", sid)
+ 
+     def run():
+@@ -6721,7 +6797,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+             with session["history_lock"]:
+                 session["running"] = False
+                 session["last_active"] = time.time()
++                if session.get("active_response_id") == response_id:
++                    session.pop("active_response_id", None)
+                 _clear_inflight_turn(session)
++            try:
++                if getattr(agent, "_current_response_id", None) == response_id:
++                    setattr(agent, "_current_response_id", None)
++            except Exception:
++                pass
+             _emit("session.info", sid, _session_info(agent, session))
+ 
+         # Chain a goal-continuation turn if the judge said so. We do
+-- 
+2.50.1 (Apple Git-155)
+

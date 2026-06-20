@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 11:20:41 -0700
+Subject: [PATCH 2/8] fix(agent): catch TypeError alongside JSONDecodeError in
+ Keychain parsing
+
+The Keychain credential payload can arrive as a non-string type under
+certain macOS Keychain states, raising TypeError instead of
+JSONDecodeError. Catch both to avoid crashing the adapter.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 03e8b58e1..9d40d9a55 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -893,10 +893,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+     raw = result.stdout.strip()
+     if not raw:
+         return None
++    if not isinstance(raw, (str, bytes, bytearray)):
++        logger.debug("Keychain: credentials payload is not text/bytes")
++        return None
+ 
+     try:
+         data = json.loads(raw)
+-    except json.JSONDecodeError:
++    except (json.JSONDecodeError, TypeError):
+         logger.debug("Keychain: credentials payload is not valid JSON")
+         return None
+ 
+-- 
+2.50.1 (Apple Git-155)
+

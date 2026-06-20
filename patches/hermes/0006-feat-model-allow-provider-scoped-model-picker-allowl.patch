@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 12:05:56 -0700
+Subject: [PATCH 6/8] feat(model): allow provider-scoped model picker allowlist
+
+Add model_picker.allow so users can restrict picker visibility to exact provider/model pairs. The filter is provider-scoped, so gpt-5.5 can be shown only for openai-codex without also surfacing OpenAI API, Nous, or OpenRouter variants.
+
+The policy is picker-only: explicit /model switches remain available for power users, while CLI/TUI/dashboard picker payloads share the filtered inventory centrally.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index 7f0d3d220..a5ed79f1c 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -76,6 +76,17 @@ class ConfigContext:
+         return replace(self, **kw) if kw else self
+ 
+ 
++@dataclass(frozen=True)
++class ModelPickerFilter:
++    """Provider-scoped model allowlist for picker visibility.
++
++    The allowlist is deliberately picker-only: it hides provider/model pairs
++    from model-option payloads without blocking explicit ``/model`` switches.
++    """
++
++    allow: dict[str, set[str]]
++
++
+ def load_picker_context() -> ConfigContext:
+     """Load the disk-config snapshot every consumer needs.
+ 
+@@ -105,6 +116,124 @@ def load_picker_context() -> ConfigContext:
+     )
+ 
+ 
++def load_model_picker_filter() -> ModelPickerFilter | None:
++    """Load ``model_picker.allow`` from config.yaml, if configured.
++
++    Supported shapes::
++
++        model_picker:
++          allow:
++            openai-codex: [gpt-5.5]
++            zai: [glm-5.2]
++
++    and::
++
++        model_picker:
++          allow:
++            - provider: openai-codex
++              models: [gpt-5.5]
++            - provider: zai
++              model: glm-5.2
++    """
++    from hermes_cli.config import load_config
++
++    cfg = load_config()
++    section = cfg.get("model_picker") if isinstance(cfg, dict) else None
++    if not isinstance(section, dict):
++        return None
++    raw_allow = section.get("allow")
++    allow: dict[str, set[str]] = {}
++
++    def _provider_key(value: object) -> str:
++        try:
++            from hermes_cli.models import normalize_provider
++
++            return normalize_provider(str(value or ""))
++        except Exception:
++            return str(value or "").strip().lower()
++
++    def _add(provider: object, models: object) -> None:
++        provider_key = _provider_key(provider)
++        if not provider_key:
++            return
++        if isinstance(models, str):
++            values = [models]
++        elif isinstance(models, (list, tuple, set)):
++            values = list(models)
++        else:
++            values = []
++        cleaned = {str(model).strip() for model in values if str(model).strip()}
++        if cleaned:
++            allow.setdefault(provider_key, set()).update(cleaned)
++
++    if isinstance(raw_allow, dict):
++        for provider, models in raw_allow.items():
++            _add(provider, models)
++    elif isinstance(raw_allow, list):
++        for entry in raw_allow:
++            if not isinstance(entry, dict):
++                continue
++            models = entry.get("models", entry.get("model"))
++            _add(entry.get("provider", ""), models)
++
++    return ModelPickerFilter(allow=allow) if allow else None
++
++
++def apply_model_picker_filter(
++    rows: list[dict],
++    picker_filter: ModelPickerFilter | None,
++    *,
++    current_provider: str = "",
++    current_model: str = "",
++) -> tuple[list[dict], dict | None]:
++    """Apply provider-scoped model picker allowlist to provider rows."""
++    if picker_filter is None:
++        return rows, None
++
++    try:
++        from hermes_cli.models import normalize_provider
++    except Exception:
++        normalize_provider = None  # type: ignore[assignment]
++
++    def _provider_key(value: object) -> str:
++        raw = str(value or "").strip().lower()
++        if normalize_provider is None:
++            return raw
++        try:
++            return normalize_provider(raw)
++        except Exception:
++            return raw
++
++    filtered_rows: list[dict] = []
++    for row in rows:
++        slug = _provider_key(row.get("slug", ""))
++        allowed = picker_filter.allow.get(slug)
++        if not allowed:
++            continue
++        allowed_lower = {m.lower() for m in allowed}
++        visible_models = [
++            model
++            for model in (row.get("models") or [])
++            if str(model) in allowed or str(model).lower() in allowed_lower
++        ]
++        if not visible_models:
++            continue
++        next_row = dict(row)
++        next_row["models"] = visible_models
++        next_row["total_models"] = len(visible_models)
++        next_row["picker_filtered"] = True
++        filtered_rows.append(next_row)
++
++    current_key = _provider_key(current_provider)
++    current_allowed = False
++    if current_key in picker_filter.allow and current_model:
++        allowed = picker_filter.allow[current_key]
++        current_allowed = current_model in allowed or current_model.lower() in {
++            m.lower() for m in allowed
++        }
++    return filtered_rows, {"active": True, "current_allowed": bool(current_allowed)}
++
++
+ # ─── Public: payload builder ────────────────────────────────────────────
+ 
+ 
+@@ -203,6 +332,17 @@ def build_models_payload(
+ 
+     if include_unconfigured:
+         rows = list(rows) + _append_unconfigured_rows(rows, ctx)
++
++    filter_meta = None
++    picker_filter = load_model_picker_filter()
++    if picker_filter is not None:
++        rows, filter_meta = apply_model_picker_filter(
++            rows,
++            picker_filter,
++            current_provider=ctx.current_provider,
++            current_model=ctx.current_model,
++        )
++
+     if picker_hints:
+         _apply_picker_hints(rows)
+     if canonical_order:
+@@ -212,11 +352,14 @@ def build_models_payload(
+     if capabilities:
+         _apply_capabilities(rows)
+ 
+-    return {
++    payload = {
+         "providers": rows,
+         "model": ctx.current_model,
+         "provider": ctx.current_provider,
+     }
++    if filter_meta is not None:
++        payload["filter"] = filter_meta
++    return payload
+ 
+ 
+ def _apply_capabilities(rows: list[dict]) -> None:
+diff --git a/tests/hermes_cli/test_inventory.py b/tests/hermes_cli/test_inventory.py
+index 2eff7bd46..a3262c645 100644
+--- a/tests/hermes_cli/test_inventory.py
++++ b/tests/hermes_cli/test_inventory.py
+@@ -168,6 +168,70 @@ def test_build_models_payload_returns_expected_shape():
+     assert payload["providers"] == rows
+ 
+ 
++def test_model_picker_allowlist_filters_provider_scoped_model_pairs():
++    rows = [
++        {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5.5", "gpt-5.4"],
++         "total_models": 2, "is_current": True, "is_user_defined": False,
++         "source": "built-in"},
++        {"slug": "openai-api", "name": "OpenAI API", "models": ["gpt-5.5"],
++         "total_models": 1, "is_current": False, "is_user_defined": False,
++         "source": "built-in"},
++        {"slug": "nous", "name": "Nous", "models": ["openai/gpt-5.5", "z-ai/glm-5.2"],
++         "total_models": 2, "is_current": False, "is_user_defined": False,
++         "source": "built-in"},
++        {"slug": "zai", "name": "Z.AI", "models": ["glm-5.2", "glm-5.1"],
++         "total_models": 2, "is_current": False, "is_user_defined": False,
++         "source": "built-in"},
++    ]
++    cfg = {
++        "model_picker": {
++            "allow": {
++                "openai-codex": ["gpt-5.5"],
++                "zai": ["glm-5.2"],
++            }
++        }
++    }
++    ctx = _empty_ctx(provider="openai-codex", model="gpt-5.5")
++
++    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value=cfg):
++        payload = build_models_payload(ctx)
++
++    assert [(r["slug"], r["models"]) for r in payload["providers"]] == [
++        ("openai-codex", ["gpt-5.5"]),
++        ("zai", ["glm-5.2"]),
++    ]
++    assert payload["filter"] == {"active": True, "current_allowed": True}
++
++
++def test_model_picker_allowlist_accepts_list_shape_and_marks_current_hidden():
++    rows = [
++        {"slug": "openai-codex", "name": "OpenAI Codex", "models": ["gpt-5.5"],
++         "total_models": 1, "is_current": False, "is_user_defined": False,
++         "source": "built-in"},
++        {"slug": "zai", "name": "Z.AI", "models": ["glm-5.2", "glm-5.1"],
++         "total_models": 2, "is_current": False, "is_user_defined": False,
++         "source": "built-in"},
++    ]
++    cfg = {
++        "model_picker": {
++            "allow": [
++                {"provider": "openai-codex", "models": ["gpt-5.5"]},
++                {"provider": "zai", "model": "glm-5.2"},
++            ]
++        }
++    }
++    ctx = _empty_ctx(provider="zai", model="glm-5.1")
++
++    with _list_auth_returning(rows), patch("hermes_cli.config.load_config", return_value=cfg):
++        payload = build_models_payload(ctx, include_unconfigured=True)
++
++    assert [(r["slug"], r["models"]) for r in payload["providers"]] == [
++        ("openai-codex", ["gpt-5.5"]),
++        ("zai", ["glm-5.2"]),
++    ]
++    assert payload["filter"] == {"active": True, "current_allowed": False}
++
++
+ def test_build_models_payload_does_not_call_provider_model_ids():
+     """``build_models_payload`` is a thin shape adapter — it delegates the
+     actual curation to ``list_authenticated_providers`` (which DOES call
+-- 
+2.50.1 (Apple Git-155)
+
