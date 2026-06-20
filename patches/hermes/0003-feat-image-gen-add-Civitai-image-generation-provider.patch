@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 11:20:47 -0700
+Subject: [PATCH 3/7] feat(image-gen): add Civitai image generation provider
+
+Add a Civitai Orchestration API image generation backend for SDXL/Illustrious AIR checkpoints and LoRAs.
+
+The provider keeps Civitai-specific networking self-contained: it shells out to curl with proxy environment variables stripped to avoid Cloudflare/Python TLS issues, without adding a generic local-execution hook or writing secrets into temporary scripts.
+
+Includes direct provider coverage for payload construction, model selection, LoRA parsing, failure handling, curl dispatch, and text-only modality reporting.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/plugins/image_gen/civitai/__init__.py b/plugins/image_gen/civitai/__init__.py
+new file mode 100644
+index 000000000..a2c891ac8
+--- /dev/null
++++ b/plugins/image_gen/civitai/__init__.py
+@@ -0,0 +1,457 @@
++"""Civitai Orchestration API image generation backend.
++
++This provider submits a single Civitai ``imageGen`` workflow and returns the
++first signed blob URL from the completed workflow response. It intentionally
++keeps Civitai-specific networking inside the provider: Civitai's Cloudflare WAF
++has historically blocked Python HTTP clients/proxy-routed traffic, while curl's
++TLS fingerprint works reliably, so requests are made with ``curl`` and proxy
++environment variables stripped.
++
++Model selection precedence, first match wins:
++
++1. explicit ``model=...`` forwarded by the image generation tool
++2. ``CIVITAI_IMAGE_MODEL`` environment variable
++3. ``image_gen.civitai.model`` in config.yaml
++4. ``image_gen.model`` in config.yaml, when it is one of this provider's IDs
++5. :data:`DEFAULT_MODEL`
++
++Custom AIR checkpoints and LoRAs are supported through forward-compatible
++kwargs: ``checkpoint`` overrides the preset checkpoint, and ``loras`` accepts a
++JSON object or mapping of ``AIR -> strength``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import subprocess
++from typing import Any, Dict, List, Mapping, Optional, Tuple
++
++from agent.image_gen_provider import (
++    DEFAULT_ASPECT_RATIO,
++    ImageGenProvider,
++    error_response,
++    resolve_aspect_ratio,
++    success_response,
++)
++
++logger = logging.getLogger(__name__)
++
++API_BASE = "https://orchestration.civitai.com"
++WORKFLOWS_URL = f"{API_BASE}/v2/consumer/workflows"
++DEFAULT_WAIT = 120
++REQUEST_TIMEOUT = 130  # slightly above wait
++
++_SDXL_SIZES: Dict[str, str] = {
++    "landscape": "1216x832",
++    "square": "1024x1024",
++    "portrait": "832x1216",
++}
++
++_DEFAULT_CHECKPOINT_WAI = "urn:air:sdxl:checkpoint:civitai:827184@2883731"
++_DEFAULT_CHECKPOINT_JANKU = "urn:air:sdxl:checkpoint:civitai:1277670@2786084"
++
++_MODELS: Dict[str, Dict[str, Any]] = {
++    "illustrious": {
++        "display": "WAI Illustrious v17.0",
++        "speed": "~25s",
++        "strengths": "Anime/illustration, NSFW-capable, wide LoRA ecosystem",
++        "engine": "sdcpp",
++        # Civitai requires ecosystem=sdxl even for Illustrious/Anima-family AIRs.
++        "ecosystem": "sdxl",
++        "checkpoint": _DEFAULT_CHECKPOINT_WAI,
++        "sizes": _SDXL_SIZES,
++        "defaults": {"cfgScale": 4, "steps": 30, "sampleMethod": "euler_a"},
++    },
++    "janku": {
++        "display": "JANKU + Chenkin & NoobAI v7.77",
++        "speed": "~25s",
++        "strengths": "NSFW-optimized, explicit tags, BREAK-compatible",
++        "engine": "sdcpp",
++        "ecosystem": "sdxl",
++        "checkpoint": _DEFAULT_CHECKPOINT_JANKU,
++        "sizes": _SDXL_SIZES,
++        "defaults": {"cfgScale": 3, "steps": 25, "sampleMethod": "euler_a"},
++    },
++}
++
++DEFAULT_MODEL = "janku"
++_PROXY_ENV_NAMES = frozenset({"http_proxy", "https_proxy", "all_proxy", "no_proxy", "ftp_proxy"})
++
++
++def _load_config() -> Dict[str, Any]:
++    """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
++    try:
++        from hermes_cli.config import load_config
++
++        cfg = load_config()
++        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
++        return section if isinstance(section, dict) else {}
++    except Exception as exc:
++        logger.debug("Could not load image_gen config: %s", exc)
++        return {}
++
++
++def _resolve_model(explicit_model: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
++    """Decide which model preset to use and return ``(model_id, meta)``."""
++    candidates: list[object] = [explicit_model, os.environ.get("CIVITAI_IMAGE_MODEL")]
++
++    cfg = _load_config()
++    civitai_cfg = cfg.get("civitai") if isinstance(cfg.get("civitai"), dict) else {}
++    if isinstance(civitai_cfg, dict):
++        candidates.append(civitai_cfg.get("model"))
++    candidates.append(cfg.get("model"))
++
++    for candidate in candidates:
++        if isinstance(candidate, str):
++            key = candidate.strip().lower()
++            if key in _MODELS:
++                return key, _MODELS[key]
++    return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
++
++
++def _resolve_dimensions(meta: Mapping[str, Any], aspect: str) -> Tuple[int, int]:
++    """Return ``(width, height)`` for the given aspect ratio."""
++    sizes = meta.get("sizes", {})
++    size_str = sizes.get(aspect, "1024x1024") if isinstance(sizes, Mapping) else "1024x1024"
++    try:
++        w, h = str(size_str).split("x", 1)
++        return int(w), int(h)
++    except (ValueError, TypeError):
++        return 1024, 1024
++
++
++def _clean_env_without_proxies() -> Dict[str, str]:
++    """Return a subprocess environment with proxy variables removed."""
++    return {key: value for key, value in os.environ.items() if key.lower() not in _PROXY_ENV_NAMES}
++
++
++def _call_api(api_key: str, payload: Dict[str, Any], wait: int = DEFAULT_WAIT) -> Dict[str, Any]:
++    """Submit a workflow with curl and return the parsed JSON response."""
++    url = f"{WORKFLOWS_URL}?wait={wait}"
++    result = subprocess.run(
++        [
++            "curl",
++            "-sS",
++            "--fail-with-body",
++            "-X",
++            "POST",
++            url,
++            "-H",
++            f"Authorization: Bearer {api_key}",
++            "-H",
++            "Content-Type: application/json",
++            "-H",
++            "User-Agent: hermes-civitai/1.0",
++            "--data-binary",
++            json.dumps(payload),
++            "--max-time",
++            str(REQUEST_TIMEOUT),
++        ],
++        capture_output=True,
++        text=True,
++        timeout=REQUEST_TIMEOUT + 5,
++        env=_clean_env_without_proxies(),
++    )
++
++    if result.returncode != 0:
++        detail = (result.stdout or result.stderr or "").strip()[:500]
++        raise RuntimeError(f"Civitai API curl failed (exit {result.returncode}): {detail}")
++
++    try:
++        response = json.loads(result.stdout)
++    except json.JSONDecodeError as exc:
++        raise RuntimeError(f"Civitai API returned non-JSON: {result.stdout[:500]}") from exc
++    if not isinstance(response, dict):
++        raise RuntimeError("Civitai API returned a non-object JSON response")
++    return response
++
++
++def _extract_image_url(workflow: Mapping[str, Any]) -> Optional[str]:
++    """Walk the workflow response and return the first blob URL, if any."""
++    steps = workflow.get("steps", [])
++    if not isinstance(steps, list):
++        return None
++    for step in steps:
++        output = step.get("output", {}) if isinstance(step, dict) else {}
++        images = output.get("images", []) if isinstance(output, dict) else []
++        if not isinstance(images, list):
++            continue
++        for image in images:
++            if isinstance(image, dict):
++                url = image.get("url")
++                if isinstance(url, str) and url:
++                    return url
++    return None
++
++
++def _parse_loras(value: Any) -> tuple[Optional[Dict[str, float]], Optional[str]]:
++    """Parse a Civitai LoRA mapping from JSON/string/mapping input."""
++    if value in (None, ""):
++        return None, None
++    try:
++        raw = json.loads(value) if isinstance(value, str) else value
++    except json.JSONDecodeError as exc:
++        return None, f"Invalid loras format (expected JSON object): {exc}"
++    if not isinstance(raw, Mapping):
++        return None, "Invalid loras format (expected JSON object mapping AIR URNs to strengths)"
++
++    parsed: Dict[str, float] = {}
++    for air, strength in raw.items():
++        air_text = str(air).strip()
++        if not air_text:
++            continue
++        try:
++            parsed[air_text] = float(strength)
++        except (TypeError, ValueError):
++            return None, f"Invalid LoRA strength for {air_text!r}: {strength!r}"
++    return parsed or None, None
++
++
++def _coerce_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return max(minimum, min(maximum, parsed))
++
++
++def _build_workflow(
++    *,
++    prompt: str,
++    aspect: str,
++    model_meta: Mapping[str, Any],
++    checkpoint: Any = None,
++    negative_prompt: Any = None,
++    loras: Optional[Dict[str, float]] = None,
++    quantity: Any = 1,
++    steps: Any = None,
++    cfg_scale: Any = None,
++    sample_method: Any = None,
++    seed: Any = None,
++) -> tuple[Dict[str, Any], int, int]:
++    """Build the Civitai workflow payload and return it with dimensions."""
++    width, height = _resolve_dimensions(model_meta, aspect)
++    step_input: Dict[str, Any] = {
++        "engine": str(model_meta.get("engine") or "sdcpp"),
++        "prompt": prompt,
++        "width": width,
++        "height": height,
++        "outputFormat": "jpeg",
++    }
++
++    defaults = model_meta.get("defaults", {})
++    if isinstance(defaults, Mapping):
++        step_input.update(defaults)
++
++    ecosystem = model_meta.get("ecosystem")
++    if ecosystem:
++        step_input["ecosystem"] = str(ecosystem)
++
++    selected_checkpoint = checkpoint or model_meta.get("checkpoint")
++    if selected_checkpoint:
++        step_input["model"] = str(selected_checkpoint)
++
++    if negative_prompt:
++        step_input["negativePrompt"] = str(negative_prompt)
++    if steps is not None:
++        step_input["steps"] = _coerce_int(steps, minimum=1, maximum=150, default=int(step_input.get("steps", 30)))
++    if cfg_scale is not None:
++        try:
++            step_input["cfgScale"] = float(cfg_scale)
++        except (TypeError, ValueError):
++            pass
++    if sample_method:
++        step_input["sampleMethod"] = str(sample_method)
++    if seed is not None:
++        try:
++            step_input["seed"] = int(seed)
++        except (TypeError, ValueError):
++            pass
++    if loras:
++        step_input["loras"] = loras
++
++    image_count = _coerce_int(quantity, minimum=1, maximum=4, default=1)
++    if image_count > 1:
++        step_input["quantity"] = image_count
++
++    return {"steps": [{"$type": "imageGen", "input": step_input}], "allowMatureContent": True}, width, height
++
++
++class CivitaiImageGenProvider(ImageGenProvider):
++    """Civitai Orchestration API — SDXL/Illustrious custom AIRs and LoRAs."""
++
++    @property
++    def name(self) -> str:
++        return "civitai"
++
++    @property
++    def display_name(self) -> str:
++        return "Civitai"
++
++    def is_available(self) -> bool:
++        return bool(os.environ.get("CIVITAI_API_KEY"))
++
++    def list_models(self) -> List[Dict[str, Any]]:
++        return [
++            {
++                "id": model_id,
++                "display": str(meta["display"]),
++                "speed": str(meta["speed"]),
++                "strengths": str(meta.get("strengths", "")),
++                "price": "Buzz credits",
++            }
++            for model_id, meta in _MODELS.items()
++        ]
++
++    def default_model(self) -> Optional[str]:
++        return DEFAULT_MODEL
++
++    def capabilities(self) -> Dict[str, Any]:
++        return {"modalities": ["text"], "max_reference_images": 0}
++
++    def get_setup_schema(self) -> Dict[str, Any]:
++        return {
++            "name": "Civitai",
++            "badge": "buzz",
++            "tag": "Civitai Orchestration API for SDXL/Illustrious AIR checkpoints and LoRAs",
++            "env_vars": [
++                {
++                    "key": "CIVITAI_API_KEY",
++                    "prompt": "Civitai Orchestration API key",
++                    "url": "https://civitai.com/user/account",
++                },
++            ],
++        }
++
++    def generate(
++        self,
++        prompt: str,
++        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
++        *,
++        image_url: Optional[str] = None,
++        reference_image_urls: Optional[List[str]] = None,
++        **kwargs: Any,
++    ) -> Dict[str, Any]:
++        prompt = (prompt or "").strip()
++        aspect = resolve_aspect_ratio(aspect_ratio)
++        model_id, meta = _resolve_model(kwargs.get("model") if isinstance(kwargs.get("model"), str) else None)
++
++        if image_url or reference_image_urls:
++            return error_response(
++                error="Civitai backend currently supports text-to-image only; omit image_url/reference_image_urls.",
++                error_type="modality_unsupported",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++        if not prompt:
++            return error_response(
++                error="Prompt is required and must be a non-empty string",
++                error_type="invalid_argument",
++                provider="civitai",
++                model=model_id,
++                aspect_ratio=aspect,
++            )
++
++        api_key = os.environ.get("CIVITAI_API_KEY")
++        if not api_key:
++            return error_response(
++                error="CIVITAI_API_KEY not set. Run `hermes tools` → Image Generation → Civitai to configure.",
++                error_type="auth_required",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
++        loras, lora_error = _parse_loras(kwargs.get("loras"))
++        if lora_error:
++            return error_response(
++                error=lora_error,
++                error_type="invalid_argument",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
++        workflow, width, height = _build_workflow(
++            prompt=prompt,
++            aspect=aspect,
++            model_meta=meta,
++            checkpoint=kwargs.get("checkpoint"),
++            negative_prompt=kwargs.get("negative_prompt"),
++            loras=loras,
++            quantity=kwargs.get("quantity", 1),
++            steps=kwargs.get("steps"),
++            cfg_scale=kwargs.get("cfg_scale"),
++            sample_method=kwargs.get("sample_method"),
++            seed=kwargs.get("seed"),
++        )
++
++        try:
++            result = _call_api(api_key, workflow)
++        except RuntimeError as exc:
++            logger.debug("Civitai generation failed", exc_info=True)
++            return error_response(
++                error=str(exc),
++                error_type="api_error",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
++        status = result.get("status")
++        if status == "failed":
++            step_errors: list[str] = []
++            for step in result.get("steps", []):
++                output = step.get("output", {}) if isinstance(step, dict) else {}
++                errors = output.get("errors", []) if isinstance(output, dict) else []
++                if isinstance(errors, list):
++                    step_errors.extend(str(error) for error in errors)
++            return error_response(
++                error="; ".join(step_errors) if step_errors else "Workflow failed",
++                error_type="api_error",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
++        image = _extract_image_url(result)
++        if not image:
++            return error_response(
++                error=f"Workflow {status or 'completed'} but no image URL in response",
++                error_type="empty_response",
++                provider="civitai",
++                model=model_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
++        extra: Dict[str, Any] = {"width": width, "height": height}
++        cost = result.get("cost")
++        if isinstance(cost, dict) and cost.get("total") is not None:
++            extra["buzz"] = cost.get("total")
++        workflow_id = result.get("id")
++        if isinstance(workflow_id, str) and workflow_id:
++            extra["workflow_id"] = workflow_id
++
++        return success_response(
++            image=image,
++            model=model_id,
++            prompt=prompt,
++            aspect_ratio=aspect,
++            provider="civitai",
++            modality="text",
++            extra=extra,
++        )
++
++
++def register(ctx) -> None:
++    """Plugin entry point — wire ``CivitaiImageGenProvider`` into the registry."""
++    ctx.register_image_gen_provider(CivitaiImageGenProvider())
+diff --git a/plugins/image_gen/civitai/plugin.yaml b/plugins/image_gen/civitai/plugin.yaml
+new file mode 100644
+index 000000000..efd09d4d1
+--- /dev/null
++++ b/plugins/image_gen/civitai/plugin.yaml
+@@ -0,0 +1,7 @@
++name: civitai
++version: 1.0.0
++description: "Civitai Orchestration API image generation — Flux 2, SDXL/Illustrious/Anima, custom AIR checkpoints, LoRAs. Images returned as signed URLs."
++author: Nako + Quill
++kind: backend
++requires_env:
++  - CIVITAI_API_KEY
+\ No newline at end of file
+diff --git a/tests/plugins/image_gen/test_civitai_provider.py b/tests/plugins/image_gen/test_civitai_provider.py
+new file mode 100644
+index 000000000..232c7d6c1
+--- /dev/null
++++ b/tests/plugins/image_gen/test_civitai_provider.py
+@@ -0,0 +1,187 @@
++from __future__ import annotations
++
++import json
++import subprocess
++from types import SimpleNamespace
++
++from plugins.image_gen.civitai import (
++    CivitaiImageGenProvider,
++    _build_workflow,
++    _call_api,
++    _clean_env_without_proxies,
++    _extract_image_url,
++    _MODELS,
++)
++
++
++def test_civitai_provider_defaults_to_janku_text_only():
++    provider = CivitaiImageGenProvider()
++
++    assert provider.name == "civitai"
++    assert provider.default_model() == "janku"
++    assert provider.capabilities() == {"modalities": ["text"], "max_reference_images": 0}
++    assert [row["id"] for row in provider.list_models()] == ["illustrious", "janku"]
++
++
++def test_build_workflow_uses_sdxl_ecosystem_for_illustrious_and_loras():
++    loras = {"urn:air:sdxl:lora:civitai:2613391@2963607": 0.8}
++
++    workflow, width, height = _build_workflow(
++        prompt="anime puppy girl",
++        aspect="portrait",
++        model_meta=_MODELS["janku"],
++        negative_prompt="low quality",
++        loras=loras,
++        quantity=3,
++        steps=28,
++        cfg_scale="3.5",
++        seed="1234",
++    )
++
++    step_input = workflow["steps"][0]["input"]
++    assert workflow["allowMatureContent"] is True
++    assert width == 832
++    assert height == 1216
++    assert step_input["engine"] == "sdcpp"
++    assert step_input["ecosystem"] == "sdxl"
++    assert step_input["model"] == "urn:air:sdxl:checkpoint:civitai:1277670@2786084"
++    assert step_input["prompt"] == "anime puppy girl"
++    assert step_input["negativePrompt"] == "low quality"
++    assert step_input["loras"] == loras
++    assert step_input["quantity"] == 3
++    assert step_input["steps"] == 28
++    assert step_input["cfgScale"] == 3.5
++    assert step_input["seed"] == 1234
++
++
++def test_generate_reports_missing_key_without_network(monkeypatch):
++    monkeypatch.delenv("CIVITAI_API_KEY", raising=False)
++
++    result = CivitaiImageGenProvider().generate("draw something", model="illustrious")
++
++    assert result["success"] is False
++    assert result["error_type"] == "auth_required"
++    assert result["model"] == "illustrious"
++
++
++def test_generate_rejects_image_to_image_with_clear_error(monkeypatch):
++    monkeypatch.setenv("CIVITAI_API_KEY", "test-key")
++
++    result = CivitaiImageGenProvider().generate(
++        "edit this",
++        image_url="/tmp/source.png",
++    )
++
++    assert result["success"] is False
++    assert result["error_type"] == "modality_unsupported"
++    assert "text-to-image only" in result["error"]
++
++
++def test_generate_success_uses_explicit_model_and_extracts_buzz(monkeypatch):
++    from plugins.image_gen import civitai
++
++    monkeypatch.setenv("CIVITAI_API_KEY", "test-key")
++
++    def fake_call_api(api_key, workflow, wait=civitai.DEFAULT_WAIT):
++        assert api_key == "test-key"
++        step_input = workflow["steps"][0]["input"]
++        assert step_input["model"] == "urn:air:sdxl:checkpoint:civitai:1277670@2786084"
++        return {
++            "id": "wf_123",
++            "status": "succeeded",
++            "cost": {"total": 5},
++            "steps": [{"output": {"images": [{"url": "https://example.invalid/out.jpg"}]}}],
++        }
++
++    monkeypatch.setattr(civitai, "_call_api", fake_call_api)
++
++    result = CivitaiImageGenProvider().generate("draw", aspect_ratio="square", model="janku")
++
++    assert result["success"] is True
++    assert result["provider"] == "civitai"
++    assert result["model"] == "janku"
++    assert result["image"] == "https://example.invalid/out.jpg"
++    assert result["buzz"] == 5
++    assert result["workflow_id"] == "wf_123"
++    assert result["width"] == 1024
++    assert result["height"] == 1024
++
++
++def test_generate_failed_workflow_surfaces_step_errors(monkeypatch):
++    from plugins.image_gen import civitai
++
++    monkeypatch.setenv("CIVITAI_API_KEY", "test-key")
++    monkeypatch.setattr(
++        civitai,
++        "_call_api",
++        lambda *_args, **_kwargs: {
++            "status": "failed",
++            "steps": [{"output": {"errors": ["bad AIR", "quota exhausted"]}}],
++        },
++    )
++
++    result = CivitaiImageGenProvider().generate("draw")
++
++    assert result["success"] is False
++    assert result["error_type"] == "api_error"
++    assert result["error"] == "bad AIR; quota exhausted"
++
++
++def test_call_api_uses_curl_without_proxy_env(monkeypatch):
++    from plugins.image_gen import civitai
++
++    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
++    captured = {}
++
++    def fake_run(cmd, **kwargs):
++        captured["cmd"] = cmd
++        captured["env"] = kwargs["env"]
++        return SimpleNamespace(
++            returncode=0,
++            stdout=json.dumps({"status": "succeeded", "steps": []}),
++            stderr="",
++        )
++
++    monkeypatch.setattr(civitai.subprocess, "run", fake_run)
++
++    response = _call_api("secret-token", {"steps": []})
++
++    assert response["status"] == "succeeded"
++    assert captured["cmd"][0] == "curl"
++    assert "--fail-with-body" in captured["cmd"]
++    assert "HTTPS_PROXY" not in captured["env"]
++    assert "https_proxy" not in {key.lower() for key in captured["env"]}
++
++
++def test_call_api_error_does_not_echo_secret(monkeypatch):
++    from plugins.image_gen import civitai
++
++    def fake_run(*_args, **_kwargs):
++        return SimpleNamespace(returncode=22, stdout="forbidden", stderr="")
++
++    monkeypatch.setattr(civitai.subprocess, "run", fake_run)
++
++    try:
++        _call_api("super-secret-token", {"steps": []})
++    except RuntimeError as exc:
++        assert "super-secret-token" not in str(exc)
++        assert "forbidden" in str(exc)
++    else:  # pragma: no cover - defensive
++        raise AssertionError("_call_api should raise on curl failure")
++
++
++def test_extract_image_url_ignores_malformed_steps():
++    assert _extract_image_url({"steps": [None, {"output": {"images": [123, {"url": "u"}]}}]}) == "u"
++    assert _extract_image_url({"steps": [{"output": {"images": []}}]}) is None
++
++
++def test_clean_env_without_proxies_removes_proxy_keys(monkeypatch):
++    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid")
++    monkeypatch.setenv("no_proxy", "localhost")
++    monkeypatch.setenv("KEEP_ME", "1")
++
++    env = _clean_env_without_proxies()
++
++    assert "HTTP_PROXY" not in env
++    assert "no_proxy" not in env
++    assert env["KEEP_ME"] == "1"
+diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
+index 101b000db..fa319dd83 100644
+--- a/tools/image_generation_tool.py
++++ b/tools/image_generation_tool.py
+@@ -1349,6 +1349,7 @@ def _dispatch_to_plugin_provider(
+             norm_refs = normalize_reference_images(reference_image_urls)
+         if norm_refs:
+             kwargs["reference_image_urls"] = norm_refs
++
+         result = provider.generate(**kwargs)
+     except TypeError as exc:
+         # A provider whose generate() signature predates image_url support
+-- 
+2.50.1 (Apple Git-155)
+
