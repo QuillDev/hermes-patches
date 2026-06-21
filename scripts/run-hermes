@@ -6,7 +6,7 @@ if [[ ! -d "$PATCHED_WORKTREE/.git" && ! -f "$PATCHED_WORKTREE/.git" ]]; then
 fi
 cd "$PATCHED_WORKTREE"
 if command -v uv >/dev/null 2>&1; then
-  uv sync --extra dev --extra messaging >/dev/null
+  uv sync --quiet --inexact --extra dev --extra messaging
 fi
 read -r -a RUN_PARTS <<< "$RUN_CMD"
 [[ ${#RUN_PARTS[@]} -gt 0 ]] || { echo "error: run_cmd is empty" >&2; exit 1; }
