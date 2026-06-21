@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sun, 21 Jun 2026 00:58:57 -0700
+Subject: [PATCH 14/14] fix(desktop): apply typed model slash commands live
+
+Route typed /model arguments through the desktop config RPC instead of the slash worker so the active session model is updated directly. Surface confirmation-required responses without claiming the switch applied.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
+index 5a3c32417..067baa0f9 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
+@@ -297,6 +297,67 @@ describe('usePromptActions desktop slash pickers', () => {
+     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+   })
+ 
++  it('switches typed /model args through the live desktop config RPC instead of the slash worker', async () => {
++    const refreshSessions = vi.fn(async () => undefined)
++    const requestGateway = vi.fn(async (method: string) =>
++      (method === 'config.set' ? { key: 'model', value: 'glm-5.2', warning: '' } : {}) as never
++    )
++
++    let handle: HarnessHandle | null = null
++    render(<Harness onReady={h => (handle = h)} refreshSessions={refreshSessions} requestGateway={requestGateway} />)
++
++    await handle!.submitText('/model glm-5.2')
++
++    expect(requestGateway).toHaveBeenCalledWith('config.set', {
++      key: 'model',
++      session_id: RUNTIME_SESSION_ID,
++      value: 'glm-5.2'
++    })
++    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
++    expect(refreshSessions).toHaveBeenCalledTimes(1)
++  })
++
++  it('surfaces typed /model confirmation requirements without claiming the switch applied', async () => {
++    const states: Record<string, unknown>[] = []
++    const requestGateway = vi.fn(async (method: string) =>
++      (method === 'config.set'
++        ? {
++            confirm_message: '!!! EXPENSIVE MODEL WARNING !!!',
++            confirm_required: true,
++            key: 'model',
++            value: 'openai/gpt-5.5-pro',
++            warning: '!!! EXPENSIVE MODEL WARNING !!!'
++          }
++        : {}) as never
++    )
++
++    let handle: HarnessHandle | null = null
++    render(
++      <Harness
++        onReady={h => (handle = h)}
++        onSeedState={s => states.push(s)}
++        refreshSessions={async () => undefined}
++        requestGateway={requestGateway}
++      />
++    )
++
++    await handle!.submitText('/model openai/gpt-5.5-pro')
++
++    const renderedText = states
++      .flatMap(state => {
++        const messages = Array.isArray(state.messages)
++          ? (state.messages as Array<{ parts?: Array<{ text?: string }> }>)
++          : []
++
++        return messages.flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
++      })
++      .join('\n')
++
++    expect(renderedText).toContain('!!! EXPENSIVE MODEL WARNING !!!')
++    expect(renderedText).toContain('Model switch was not applied')
++    expect(renderedText).not.toContain('Model switched: openai/gpt-5.5-pro')
++  })
++
+   it('marks a timed-out handoff as failed so the next attempt can retry', async () => {
+     vi.useFakeTimers()
+     const calls: { method: string; params?: Record<string, unknown> }[] = []
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
+index f594d410c..bc541f620 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
+@@ -75,6 +75,14 @@ interface HandoffResult {
+   error?: string
+ }
+ 
++interface ConfigSetModelResponse {
++  confirm_message?: string
++  confirm_required?: boolean
++  key?: string
++  value?: string
++  warning?: string
++}
++
+ function delay(ms: number): Promise<void> {
+   return new Promise(resolve => setTimeout(resolve, ms))
+ }
+@@ -1262,8 +1270,49 @@ export function usePromptActions({
+             return
+           }
+ 
+-          // Power users can still type `/model <name>` — run it on the backend.
+-          await runExec(ctx)
++          // Power users can still type `/model <name>`, but it must use the
++          // same live-session RPC as the desktop picker. Routing through the
++          // CLI slash worker mutates only the worker's HermesCLI first and then
++          // best-effort mirrors that state back into the live gateway session;
++          // when that mirror fails or is skipped, the transcript shows command
++          // activity while the actual desktop chat stays on the old model.
++          const resolved = await withSlashOutput(ctx)
++
++          if (!resolved) {
++            return
++          }
++
++          const { render: renderSlashOutput, sessionId } = resolved
++
++          try {
++            const result = await requestGateway<ConfigSetModelResponse>('config.set', {
++              key: 'model',
++              session_id: sessionId,
++              value: ctx.arg.trim()
++            })
++
++            if (result?.confirm_required) {
++              renderSlashOutput(
++                [
++                  result.confirm_message || result.warning || 'Model switch requires confirmation.',
++                  'Model switch was not applied. Use the model picker to confirm this selection.'
++                ]
++                  .filter(Boolean)
++                  .join('\n')
++              )
++
++              return
++            }
++
++            renderSlashOutput(
++              [`Model switched: ${result?.value || ctx.arg.trim()}`, result?.warning ? `warning: ${result.warning}` : '']
++                .filter(Boolean)
++                .join('\n')
++            )
++            await refreshSessions().catch(() => undefined)
++          } catch (err) {
++            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
++          }
+ 
+           return
+         }
+-- 
+2.50.1 (Apple Git-155)
+

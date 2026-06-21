@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 22:44:58 -0700
-Subject: [PATCH 12/13] feat(api): process session slash commands
+Subject: [PATCH 12/14] feat(api): process session slash commands
 
 Add opt-in command handling for API session chat routes so /model can update the session model without running an agent turn. Persist non-secret model runtime metadata for future turns and cover JSON and SSE paths.
 
