@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:41 -0700
-Subject: [PATCH 02/10] feat(agent): normalize tool call aliases for shorthand
+Subject: [PATCH 02/11] feat(agent): normalize tool call aliases for shorthand
  names
 
 Map shorthand tool names (e.g. "write" -> "write_file", "shell" ->
@@ -257,5 +257,5 @@ index 000000000..2b03c7e3f
 +        "context": 2,
 +    }
 -- 
-2.50.1 (Apple Git-155)
+2.52.0
 

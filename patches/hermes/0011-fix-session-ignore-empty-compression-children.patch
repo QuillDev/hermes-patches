@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 22:12:22 -0700
+Subject: [PATCH 11/11] fix(session): ignore empty compression children
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/hermes_state.py b/hermes_state.py
+index 108d5fd02..2791a86fc 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -47,7 +47,9 @@ _COMPRESSION_CHILD_SQL = (
+     "EXISTS (SELECT 1 FROM sessions p"
+     "        WHERE p.id = {a}.parent_session_id"
+     "        AND p.end_reason = 'compression'"
+-    "        AND {a}.started_at >= p.ended_at)"
++    "        AND {a}.started_at >= p.ended_at"
++    "        AND (COALESCE({a}.message_count, 0) > 0"
++    "             OR COALESCE({a}.api_call_count, 0) > 0))"
+ )
+ 
+ # Rows that surface in pickers: roots + branch children (subagent runs and
+@@ -2227,11 +2229,12 @@ class SessionDB:
+         The continuation edge is the canonical one shared with
+         :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
+         (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
+-        parent ended with ``end_reason = 'compression'`` and the child started
+-        at or after the parent's ``ended_at``, which distinguishes continuations
+-        from delegate subagents / branch children that also carry a
+-        ``parent_session_id``. Expressed as a single recursive CTE rather than a
+-        per-hop Python walk so the edge definition lives in exactly one place.
++        parent ended with ``end_reason = 'compression'``, the child started at
++        or after the parent's ``ended_at``, and the child actually recorded
++        work. The final guard keeps abandoned empty client/API rows from
++        hijacking the projected live tip. Expressed as a single recursive CTE
++        rather than a per-hop Python walk so the edge definition lives in
++        exactly one place.
+         """
+         if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
+             return False
+@@ -2336,6 +2339,8 @@ class SessionDB:
+                     JOIN sessions parent ON parent.id = child.parent_session_id
+                     WHERE parent.end_reason = 'compression'
+                       AND child.started_at >= parent.ended_at
++                      AND (COALESCE(child.message_count, 0) > 0
++                           OR COALESCE(child.api_call_count, 0) > 0)
+                   ),
+                   descendants(id) AS (
+                     SELECT ?
+@@ -2346,6 +2351,8 @@ class SessionDB:
+                     JOIN sessions child ON child.parent_session_id = parent.id
+                     WHERE parent.end_reason = 'compression'
+                       AND child.started_at >= parent.ended_at
++                      AND (COALESCE(child.message_count, 0) > 0
++                           OR COALESCE(child.api_call_count, 0) > 0)
+                   ),
+                   lineage(id) AS (
+                     SELECT id FROM ancestors
+@@ -2444,10 +2451,14 @@ class SessionDB:
+         A compression continuation is a child session where:
+         1. The parent's ``end_reason = 'compression'``
+         2. The child was created AFTER the parent was ended (started_at >= ended_at)
++        3. The child recorded work (messages or API calls)
+ 
+         The second condition distinguishes compression continuations from
+         delegate subagents or branch children, which can also have a
+         ``parent_session_id`` but were created while the parent was still live.
++        The work guard ignores abandoned empty rows created by client/API resume
++        attempts, which otherwise sort newest and make old conversations open as
++        blank.
+ 
+         Returns the session_id of the latest continuation in the chain, or the
+         input ``session_id`` if it isn't part of a compression chain (or if the
+@@ -2465,6 +2476,8 @@ class SessionDB:
+                     "      SELECT ended_at FROM sessions "
+                     "      WHERE id = ? AND end_reason = 'compression'"
+                     "  ) "
++                    "  AND (COALESCE(message_count, 0) > 0 "
++                    "       OR COALESCE(api_call_count, 0) > 0) "
+                     "ORDER BY started_at DESC LIMIT 1",
+                     (current, current),
+                 )
+@@ -2606,6 +2619,8 @@ class SessionDB:
+                     JOIN sessions child ON child.parent_session_id = c.cur_id
+                     WHERE parent.end_reason = 'compression'
+                       AND child.started_at >= parent.ended_at
++                      AND (COALESCE(child.message_count, 0) > 0
++                           OR COALESCE(child.api_call_count, 0) > 0)
+                 ),
+                 chain_max AS (
+                     SELECT
+diff --git a/tests/hermes_state/test_session_archiving.py b/tests/hermes_state/test_session_archiving.py
+index 36ecb95a1..c80cf6a44 100644
+--- a/tests/hermes_state/test_session_archiving.py
++++ b/tests/hermes_state/test_session_archiving.py
+@@ -49,3 +49,22 @@ def test_unarchiving_compression_tip_unarchives_projected_root(db):
+     assert db.get_session("root")["archived"] == 0
+     assert db.get_session("tip")["archived"] == 0
+     assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
++
++
++def test_empty_newer_compression_child_does_not_hijack_projected_tip(db):
++    base = time.time() - 100
++    db.create_session("root", source="cli")
++    db.create_session("tip", source="cli", parent_session_id="root")
++    db.create_session("blank", source="api_server", parent_session_id="root")
++    db.append_message("tip", role="user", content="real continuation")
++    db._conn.execute(
++        "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression' WHERE id = 'root'",
++        (base, base + 10),
++    )
++    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'tip'", (base + 20,))
++    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'blank'", (base + 30,))
++    db._conn.commit()
++
++    assert db.get_compression_tip("root") == "tip"
++    assert db.resolve_resume_session_id("root") == "tip"
++    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
+-- 
+2.52.0
+
