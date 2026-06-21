@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 21:13:32 -0700
-Subject: [PATCH 10/14] feat(api): support session archiving over HTTP
+Subject: [PATCH 10/15] feat(api): support session archiving over HTTP
 
 Expose soft session archive state through the gateway API server so clients can archive, unarchive, and filter session lists without using the dashboard-only API.
 

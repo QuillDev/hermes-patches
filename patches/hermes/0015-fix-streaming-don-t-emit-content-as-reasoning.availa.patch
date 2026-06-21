@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sun, 21 Jun 2026 01:25:00 -0700
+Subject: [PATCH 15/15] fix(streaming): don't emit content as
+ reasoning.available when structured reasoning exists
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Models like GLM-5.2 return reasoning in a separate reasoning_content field
+alongside a visible content preamble. The conversation loop was firing
+reasoning.available with the visible content text, causing it to appear in
+both the main content panel (via assistant.delta streaming) and the thinking
+panel (via tool.progress events) during live streaming — duplicating the
+content. After session refresh the persisted message rendered correctly
+because content and reasoning_content are stored separately.
+
+Fix: skip the content-as-reasoning fallback when the model returned
+structured reasoning fields (reasoning_content, reasoning, reasoning_details).
+The fallback is only intended for models that embed <think> tags inline
+in their content without separate API fields.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 37dd3d2fa..ceee5e5da 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3675,7 +3675,26 @@ def run_conversation(
+ 
+             # Notify progress callback of model's thinking (used by subagent
+             # delegation to relay the child's reasoning to the parent display).
+-            if (assistant_message.content and agent.tool_progress_callback):
++            #
++            # Skip this content-as-reasoning fallback when the model returned
++            # structured reasoning (reasoning_content / reasoning /
++            # reasoning_details).  In that case the visible content is a
++            # normal assistant message that was already streamed via
++            # assistant.delta events — firing it as reasoning.available
++            # duplicates it in the thinking panel during live streaming.
++            # The actual structured reasoning is either streamed via
++            # _fire_reasoning_delta (when reasoning_callback is wired) or
++            # persisted for post-refresh display.
++            _has_structured_reasoning = bool(
++                getattr(assistant_message, 'reasoning_content', None)
++                or getattr(assistant_message, 'reasoning', None)
++                or getattr(assistant_message, 'reasoning_details', None)
++            )
++            if (
++                assistant_message.content
++                and agent.tool_progress_callback
++                and not _has_structured_reasoning
++            ):
+                 _think_text = assistant_message.content.strip()
+                 # Strip reasoning XML tags that shouldn't leak to parent display
+                 _think_text = re.sub(
+-- 
+2.50.1 (Apple Git-155)
+

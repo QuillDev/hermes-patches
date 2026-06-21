@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sun, 21 Jun 2026 00:58:57 -0700
-Subject: [PATCH 14/14] fix(desktop): apply typed model slash commands live
+Subject: [PATCH 14/15] fix(desktop): apply typed model slash commands live
 
 Route typed /model arguments through the desktop config RPC instead of the slash worker so the active session model is updated directly. Surface confirmation-required responses without claiming the switch applied.
 

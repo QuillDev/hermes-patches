@@ -12,3 +12,4 @@
 0012-feat-api-process-session-slash-commands.patch
 0013-fix-session-preserve-runtime-metadata-and-archive-st.patch
 0014-fix-desktop-apply-typed-model-slash-commands-live.patch
+0015-fix-streaming-don-t-emit-content-as-reasoning.availa.patch
