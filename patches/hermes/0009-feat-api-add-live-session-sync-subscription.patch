@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 20:51:55 -0700
-Subject: [PATCH 09/11] feat(api): add live session sync subscription
+Subject: [PATCH 09/12] feat(api): add live session sync subscription
 
 Add a session subscribe SSE endpoint that emits a snapshot, catch-up
 state, and replayable live run events for clients that drop into an
@@ -564,5 +564,5 @@ index c1a78c4c1..11f08c47e 100644
      db_path = tmp_path / "response_store.db"
      store = ResponseStore(db_path=str(db_path))
 -- 
-2.52.0
+2.50.1 (Apple Git-155)
 

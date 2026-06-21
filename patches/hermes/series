@@ -9,3 +9,4 @@
 0009-feat-api-add-live-session-sync-subscription.patch
 0010-feat-api-support-session-archiving-over-HTTP.patch
 0011-fix-session-ignore-empty-compression-children.patch
+0012-feat-api-process-session-slash-commands.patch

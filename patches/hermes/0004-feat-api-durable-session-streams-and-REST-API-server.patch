@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:21:00 -0700
-Subject: [PATCH 04/11] feat(api): durable session streams and REST API server
+Subject: [PATCH 04/12] feat(api): durable session streams and REST API server
  enhancements
 
 Add durable session event streaming, session run lifecycle tracking,
@@ -4043,5 +4043,5 @@ index 7f7109d10..b37b1bb8e 100644
  
          # Chain a goal-continuation turn if the judge said so. We do
 -- 
-2.52.0
+2.50.1 (Apple Git-155)
 
