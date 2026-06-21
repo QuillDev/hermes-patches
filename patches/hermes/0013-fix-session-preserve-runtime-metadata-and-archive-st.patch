@@ -1,0 +1,791 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 23:52:21 -0700
+Subject: [PATCH 13/13] fix(session): preserve runtime metadata and archive
+ state
+
+Persist safe runtime model/provider metadata on API-created sessions so future turns restore the actual Hermes runtime instead of the advertised API model id.
+
+Also keep desktop archived/deleted sessions hidden across stale refreshes and replace transient loading indicators with quieter session UI states.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/apps/desktop/src/app/agents/index.test.tsx b/apps/desktop/src/app/agents/index.test.tsx
+new file mode 100644
+index 000000000..4dbbab5cd
+--- /dev/null
++++ b/apps/desktop/src/app/agents/index.test.tsx
+@@ -0,0 +1,59 @@
++import { cleanup, render, screen } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++
++import { $activeSessionId } from '@/store/session'
++import { $subagentsBySession, type SubagentProgress } from '@/store/subagents'
++
++import { AgentsView } from './index'
++
++Element.prototype.animate = function animate() {
++  return {
++    cancel: () => {},
++    finished: Promise.resolve()
++  } as unknown as Animation
++}
++
++const baseSubagent = (overrides: Partial<SubagentProgress>): SubagentProgress => ({
++  id: 'agent-1',
++  parentId: null,
++  goal: 'Example subagent',
++  status: 'completed',
++  taskCount: 1,
++  taskIndex: 0,
++  startedAt: 1,
++  updatedAt: Date.now(),
++  filesRead: [],
++  filesWritten: [],
++  stream: [],
++  ...overrides
++})
++
++function resetStores() {
++  $activeSessionId.set('session-1')
++  $subagentsBySession.set({})
++}
++
++beforeEach(resetStores)
++afterEach(() => {
++  cleanup()
++  resetStores()
++})
++
++describe('AgentsView activity markers', () => {
++  it('shows active subagents with an amber loader and does not print completed status text', () => {
++    $subagentsBySession.set({
++      'session-1': [
++        baseSubagent({ goal: 'NaNotes Dev Setup', id: 'done-agent', status: 'completed', updatedAt: 1000 }),
++        baseSubagent({ goal: 'Gateway Session Archiving Support', id: 'running-agent', status: 'running', updatedAt: 2000 })
++      ]
++    })
++
++    render(<AgentsView onClose={() => undefined} />)
++
++    expect(screen.getByText('NaNotes Dev Setup')).toBeTruthy()
++    expect(screen.getByText('Gateway Session Archiving Support')).toBeTruthy()
++    expect(screen.getByRole('status', { name: 'Running' })).toBeTruthy()
++    expect(screen.queryByText(/completed/i)).toBeNull()
++    expect(screen.queryByLabelText('Done')).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/agents/index.tsx b/apps/desktop/src/app/agents/index.tsx
+index 6a1fbf9ee..84ff2c363 100644
+--- a/apps/desktop/src/app/agents/index.tsx
++++ b/apps/desktop/src/app/agents/index.tsx
+@@ -20,16 +20,21 @@ import {
+ 
+ import { OverlayView } from '../overlays/overlay-view'
+ 
+-// Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
+-// same visual vocabulary as the chat tool blocks.
+ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNode {
+   if (status === 'running' || status === 'queued') {
+     return (
+-      <GlyphSpinner
+-        ariaLabel={a.running}
+-        className="size-3.5 shrink-0 text-[0.95rem] text-muted-foreground/80"
+-        spinner="breathe"
+-      />
++      <span
++        aria-label={a.running}
++        className="relative grid size-3.5 shrink-0 place-items-center"
++        role="status"
++        title={a.running}
++      >
++        <span aria-hidden className="absolute size-2 animate-ping rounded-full bg-amber-400/45" />
++        <span
++          aria-hidden
++          className="relative size-1.5 rounded-full bg-amber-400 shadow-[0_0_0.625rem_rgba(251,191,36,0.75)]"
++        />
++      </span>
+     )
+   }
+ 
+@@ -37,7 +42,7 @@ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNo
+     return <AlertCircle aria-label={a.failed} className="size-3.5 shrink-0 text-destructive" />
+   }
+ 
+-  return <CheckCircle2 aria-label={a.done} className="size-3.5 shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
++  return null
+ }
+ 
+ const STREAM_TONE: Record<SubagentStreamEntry['kind'], string> = {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.ts b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+index 36dfea759..34a543b04 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.ts
+@@ -22,6 +22,8 @@ import {
+   $messages,
+   $sessions,
+   $yoloActive,
++  clearSessionOptimisticallyHidden,
++  markSessionOptimisticallyHidden,
+   sessionPinId,
+   setActiveSessionId,
+   setAwaitingResponse,
+@@ -970,6 +972,7 @@ export function useSessionActions({
+       // live tip after compression. Drop both so the pin can't linger.
+       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
+ 
++      markSessionOptimisticallyHidden(storedSessionId, removed?._lineage_root_id)
+       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+       // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
+       // doesn't keep claiming the removed row is still on the server.
+@@ -994,6 +997,9 @@ export function useSessionActions({
+           clearQueuedPrompts(closingRuntimeId)
+         }
+       } catch (err) {
++        clearSessionOptimisticallyHidden(storedSessionId)
++        clearSessionOptimisticallyHidden(removedPinId)
++
+         if (removed) {
+           setSessions(prev => [removed, ...prev])
+           setSessionsTotal(prev => prev + 1)
+@@ -1052,6 +1058,7 @@ export function useSessionActions({
+       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
+ 
+       // Soft-hide: drop from the sidebar immediately, keep the data.
++      markSessionOptimisticallyHidden(storedSessionId, archived?._lineage_root_id)
+       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+       // Archived sessions are hidden by the listSessions(min_messages=1) query
+       // on the next refresh, so they count as "removed" for the load-more
+@@ -1073,6 +1080,9 @@ export function useSessionActions({
+         $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
+         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+       } catch (err) {
++        clearSessionOptimisticallyHidden(storedSessionId)
++        clearSessionOptimisticallyHidden(archivedPinId)
++
+         if (archived) {
+           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
+           setSessionsTotal(prev => prev + 1)
+diff --git a/apps/desktop/src/components/assistant-ui/thread-loading-skeleton.test.tsx b/apps/desktop/src/components/assistant-ui/thread-loading-skeleton.test.tsx
+new file mode 100644
+index 000000000..f9d4497eb
+--- /dev/null
++++ b/apps/desktop/src/components/assistant-ui/thread-loading-skeleton.test.tsx
+@@ -0,0 +1,43 @@
++import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
++import { render, screen } from '@testing-library/react'
++import { describe, expect, it, vi } from 'vitest'
++
++import { Thread } from './thread'
++
++class TestResizeObserver {
++  observe() {}
++  unobserve() {}
++  disconnect() {}
++}
++
++vi.stubGlobal('ResizeObserver', TestResizeObserver)
++vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
++  window.setTimeout(() => callback(performance.now()), 0)
++)
++vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
++
++Element.prototype.scrollTo = function scrollTo() {}
++
++function Harness() {
++  const runtime = useExternalStoreRuntime<ThreadMessage>({
++    messages: [],
++    isRunning: false,
++    onNew: async () => {}
++  })
++
++  return (
++    <AssistantRuntimeProvider runtime={runtime}>
++      <Thread loading="session" />
++    </AssistantRuntimeProvider>
++  )
++}
++
++describe('thread session loading skeleton', () => {
++  it('renders a layout skeleton instead of the centered loader', async () => {
++    const { container } = render(<Harness />)
++
++    expect(await screen.findByRole('status', { name: 'Loading session' })).toBeTruthy()
++    expect(container.querySelector('[data-slot="aui_thread-loading-skeleton"]')).toBeTruthy()
++    expect(container.querySelector('svg')).toBeFalsy()
++  })
++})
+diff --git a/apps/desktop/src/components/assistant-ui/thread.tsx b/apps/desktop/src/components/assistant-ui/thread.tsx
+index 1ac97c200..31157cd66 100644
+--- a/apps/desktop/src/components/assistant-ui/thread.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread.tsx
+@@ -83,7 +83,6 @@ import {
+   DropdownMenuLabel,
+   DropdownMenuTrigger
+ } from '@/components/ui/dropdown-menu'
+-import { Loader } from '@/components/ui/loader'
+ import type { HermesGateway } from '@/hermes'
+ import { useResizeObserver } from '@/hooks/use-resize-observer'
+ import { useI18n } from '@/i18n'
+@@ -211,7 +210,7 @@ export const Thread: FC<{
+         loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+         sessionKey={sessionKey}
+       />
+-      {loading === 'session' && <CenteredThreadSpinner />}
++      {loading === 'session' && <ThreadLoadingSkeleton />}
+     </div>
+   )
+ }
+@@ -226,27 +225,65 @@ function pickPrimaryPreviewTarget(targets: string[]): string[] {
+   return [localUrl || targets[targets.length - 1]]
+ }
+ 
+-const CenteredThreadSpinner: FC = () => {
++const ThreadLoadingSkeleton: FC = () => {
+   const { t } = useI18n()
+ 
+   return (
+     <div
+       aria-label={t.assistant.thread.loadingSession}
+-      className="pointer-events-none absolute inset-0 z-1 grid place-items-center"
++      className="pointer-events-none absolute inset-0 z-1 overflow-hidden bg-(--ui-chat-surface-background)"
++      data-slot="aui_thread-loading-skeleton"
+       role="status"
+     >
+-      <Loader
+-        aria-hidden="true"
+-        className="size-12 text-midground/70"
+-        pathSteps={220}
+-        role="presentation"
+-        strokeScale={0.72}
+-        type="rose-curve"
+-      />
++      <div className="mx-auto flex h-full w-full max-w-(--composer-width) min-w-0 flex-col gap-(--conversation-turn-gap) px-6 pt-[calc(var(--titlebar-height)+0.75rem)]">
++        <SkeletonTurn align="end" widths={[44, 30]} />
++        <SkeletonTurn widths={[68, 84, 58, 36]} />
++        <SkeletonToolBlock />
++        <SkeletonTurn align="end" widths={[52, 24]} />
++        <SkeletonTurn widths={[74, 62, 80, 42]} />
++        <div aria-hidden="true" className="shrink-0" style={{ height: 'var(--thread-last-message-clearance)' }} />
++      </div>
+     </div>
+   )
+ }
+ 
++const SkeletonTurn: FC<{ align?: 'start' | 'end'; widths: number[] }> = ({ align = 'start', widths }) => (
++  <div
++    aria-hidden="true"
++    className={cn(
++      'flex w-full min-w-0 flex-col gap-2.5 animate-pulse',
++      align === 'end' ? 'items-end' : 'items-start'
++    )}
++  >
++    <div
++      className={cn(
++        'flex max-w-[78%] flex-col gap-2 rounded-2xl border border-border/35 bg-(--composer-fill) p-3.5 shadow-sm',
++        align === 'end' ? 'w-[min(25rem,72%)] rounded-br-sm' : 'w-[min(42rem,88%)] rounded-bl-sm'
++      )}
++    >
++      {widths.map((width, index) => (
++        <SkeletonLine key={`${width}:${index}`} width={width} />
++      ))}
++    </div>
++  </div>
++)
++
++const SkeletonToolBlock: FC = () => (
++  <div aria-hidden="true" className="flex w-full min-w-0 animate-pulse flex-col gap-2">
++    <div className="h-3 w-28 rounded-full bg-muted-foreground/12" />
++    <div className="w-[min(34rem,82%)] rounded-xl border border-border/30 bg-card/45 p-3">
++      <div className="grid gap-2">
++        <SkeletonLine width={78} />
++        <SkeletonLine width={64} />
++      </div>
++    </div>
++  </div>
++)
++
++const SkeletonLine: FC<{ width: number }> = ({ width }) => (
++  <span className="block h-3 rounded-full bg-muted-foreground/14" style={{ width: `${width}%` }} />
++)
++
+ const AssistantMessage: FC<{
+   onBranchInNewChat?: (messageId: string) => void
+   onDismissError?: (messageId: string) => void
+diff --git a/apps/desktop/src/store/session.test.ts b/apps/desktop/src/store/session.test.ts
+index bc7866e60..786341797 100644
+--- a/apps/desktop/src/store/session.test.ts
++++ b/apps/desktop/src/store/session.test.ts
+@@ -9,7 +9,9 @@ import {
+   $currentCwd,
+   $workingSessionIds,
+   applyConfiguredDefaultProjectDir,
++  clearSessionOptimisticallyHidden,
+   getRecentlySettledSessionIds,
++  markSessionOptimisticallyHidden,
+   mergeSessionPage,
+   sessionPinId,
+   setCurrentCwd,
+@@ -119,6 +121,38 @@ describe('mergeSessionPage', () => {
+     expect(mergeSessionPage(previous, incoming, ['b']).map(s => s.id)).toEqual(['b'])
+   })
+ 
++  it('does not replay a stale refresh row after an optimistic archive', () => {
++    const previous = [session({ id: 'newer', started_at: 3 }), session({ id: 'archived', started_at: 2 })]
++    const incoming = [
++      session({ id: 'archived', message_count: 2, started_at: 2 }),
++      session({ id: 'older', started_at: 1 })
++    ]
++
++    markSessionOptimisticallyHidden('archived')
++
++    try {
++      const merged = mergeSessionPage(previous, incoming, [])
++
++      expect(merged.map(s => s.id)).toEqual(['older'])
++    } finally {
++      clearSessionOptimisticallyHidden('archived')
++    }
++  })
++
++  it('suppresses stale compression-lineage refresh rows after archiving the tip', () => {
++    const previous = [session({ id: 'tip', _lineage_root_id: 'root' })] as SessionInfo[]
++    const incoming = [session({ id: 'tip', _lineage_root_id: 'root', message_count: 2 })] as SessionInfo[]
++
++    markSessionOptimisticallyHidden('tip', 'root')
++
++    try {
++      expect(mergeSessionPage(previous, incoming, ['root'])).toEqual([])
++    } finally {
++      clearSessionOptimisticallyHidden('tip')
++      clearSessionOptimisticallyHidden('root')
++    }
++  })
++
+   it('keeps a pinned session that has aged off the recent page', () => {
+     // Repro of "loses pins until you refresh": a pinned chat falls off the
+     // most-recent page, so the server stops returning it. A hard replace would
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index 958801df1..373310004 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -116,6 +116,48 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
+ export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
+   session._lineage_root_id ?? session.id
+ 
++const OPTIMISTICALLY_HIDDEN_SESSION_TTL_MS = 30 * 1000
++const optimisticallyHiddenSessionExpiry = new Map<string, number>()
++
++function hiddenSessionKey(session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string {
++  return session._lineage_root_id ?? session.id
++}
++
++function getOptimisticallyHiddenSessionIds(now: number = Date.now()): Set<string> {
++  const live = new Set<string>()
++
++  for (const [id, expiry] of optimisticallyHiddenSessionExpiry) {
++    if (expiry > now) {
++      live.add(id)
++    } else {
++      optimisticallyHiddenSessionExpiry.delete(id)
++    }
++  }
++
++  return live
++}
++
++export function markSessionOptimisticallyHidden(
++  sessionId: string | null | undefined,
++  lineageRootId?: null | string
++): void {
++  const expiry = Date.now() + OPTIMISTICALLY_HIDDEN_SESSION_TTL_MS
++
++  if (sessionId) {
++    optimisticallyHiddenSessionExpiry.set(sessionId, expiry)
++  }
++
++  if (lineageRootId) {
++    optimisticallyHiddenSessionExpiry.set(lineageRootId, expiry)
++  }
++}
++
++export function clearSessionOptimisticallyHidden(sessionId: string | null | undefined): void {
++  if (sessionId) {
++    optimisticallyHiddenSessionExpiry.delete(sessionId)
++  }
++}
++
+ /** Merge a fresh server session page into the in-memory list, keeping any
+  *  row the server omitted that we still want visible — both still-"working"
+  *  sessions and pinned sessions.
+@@ -144,6 +186,13 @@ export function mergeSessionPage(
+   incoming: SessionInfo[],
+   keepIds: Iterable<string>
+ ): SessionInfo[] {
++  const hidden = getOptimisticallyHiddenSessionIds()
++
++  if (hidden.size > 0) {
++    previous = previous.filter(session => !hidden.has(session.id) && !hidden.has(hiddenSessionKey(session)))
++    incoming = incoming.filter(session => !hidden.has(session.id) && !hidden.has(hiddenSessionKey(session)))
++  }
++
+   const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
+ 
+   if (keep.size === 0) {
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index a9640b430..45c0d6b64 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1392,7 +1392,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 raise
+             runtime_kwargs = {}
+         reasoning_config = GatewayRunner._load_reasoning_config()
+-        model = _resolve_gateway_model()
++        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+         if request_model_override:
+             model = request_model_override.get("model") or model
+             override_runtime = request_model_override.get("runtime") or {}
+@@ -1569,6 +1569,45 @@ class APIServerAdapter(BasePlatformAdapter):
+                 runtime[key] = value
+         return {"model": model, "provider": provider, "runtime": runtime}
+ 
++    def _session_runtime_metadata(self, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
++        """Return non-secret runtime model metadata for a new API session.
++
++        ``API_SERVER_MODEL_NAME`` / ``self._model_name`` is only the
++        OpenAI-compatible advertised model id.  Session rows need the actual
++        Hermes runtime selection so future turns can restore the same
++        model/provider without persisting secrets.
++        """
++        metadata: Dict[str, Any] = dict(existing or {})
++        try:
++            from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
++
++            runtime_kwargs = _resolve_runtime_agent_kwargs()
++            model = str(runtime_kwargs.get("model") or _resolve_gateway_model() or "").strip()
++        except Exception:
++            logger.debug("failed to resolve API session runtime metadata", exc_info=True)
++            runtime_kwargs = {}
++            try:
++                from gateway.run import _resolve_gateway_model
++
++                model = str(_resolve_gateway_model() or "").strip()
++            except Exception:
++                model = ""
++
++        safe_values = {
++            "model": model,
++            "provider": str(runtime_kwargs.get("provider") or "").strip(),
++            "base_url": str(runtime_kwargs.get("base_url") or "").strip(),
++            "api_mode": str(runtime_kwargs.get("api_mode") or "").strip(),
++        }
++        for key, value in safe_values.items():
++            if value:
++                metadata[key] = value
++            else:
++                metadata.pop(key, None)
++        for secret_key in ("api_key", "credential_pool", "command", "args", "token", "tokens"):
++            metadata.pop(secret_key, None)
++        return metadata
++
+     def _process_session_command(
+         self,
+         *,
+@@ -2052,20 +2091,28 @@ class APIServerAdapter(BasePlatformAdapter):
+         session_id, err = self._new_client_session_id(body)
+         if err is not None:
+             return err
+-        model = body.get("model") or self._model_name
++        metadata = self._session_runtime_metadata()
++        model = metadata.get("model")
+         system_prompt = body.get("system_prompt") or body.get("systemPrompt")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
+         source = self._client_session_source(body)
+         try:
+-            db.create_session(session_id, source, model=str(model) if model else None, system_prompt=system_prompt, cwd=cwd)
++            db.create_session(
++                session_id,
++                source,
++                model=str(model) if model else None,
++                model_config=metadata or None,
++                system_prompt=system_prompt,
++                cwd=cwd,
++            )
+         except Exception as exc:
+             logger.exception("Failed to create unified chat session")
+             return web.json_response(_openai_error(f"Failed to create session: {exc}", err_type="server_error"), status=500)
+         title_err = self._apply_session_title(db, session_id, body.get("title"))
+         if title_err is not None:
+             return title_err
+-        session = db.get_session(session_id) or {"id": session_id, "source": source, "model": model, "title": body.get("title"), "cwd": cwd}
++        session = db.get_session(session_id) or {"id": session_id, "source": source, "model": model, "title": body.get("title"), "cwd": cwd, "model_config": metadata}
+         return web.json_response(self._session_response(session), status=201)
+ 
+     async def _create_unified_worktree_session(self, body: Dict[str, Any]) -> "web.Response":
+@@ -2097,7 +2144,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         except subprocess.CalledProcessError as exc:
+             detail = (exc.stderr or exc.stdout or str(exc)).strip()
+             return web.json_response(_openai_error(f"Failed to create worktree: {detail}", code="worktree_create_failed"), status=400)
+-        metadata = {
++        metadata = self._session_runtime_metadata({
+             "nako_worktree": {
+                 "workspace_id": workspace["id"],
+                 "repo_path": workspace["repoPath"],
+@@ -2105,8 +2152,8 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "branch_name": branch_name,
+                 "base_ref": base_ref,
+             }
+-        }
+-        model = body.get("model") or self._model_name
++        })
++        model = metadata.get("model")
+         system_prompt = body.get("system_prompt") or body.get("systemPrompt")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
+@@ -2597,11 +2644,18 @@ class APIServerAdapter(BasePlatformAdapter):
+         if db.get_session(session_id):
+             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
+ 
+-        model = body.get("model") or self._model_name
++        metadata = self._session_runtime_metadata()
++        model = metadata.get("model")
+         system_prompt = body.get("system_prompt")
+         if system_prompt is not None and not isinstance(system_prompt, str):
+             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
+-        db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
++        db.create_session(
++            session_id,
++            "api_server",
++            model=str(model) if model else None,
++            model_config=metadata or None,
++            system_prompt=system_prompt,
++        )
+         title = body.get("title")
+         if title is not None:
+             try:
+diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
+index de85fb8c5..a4157c4ec 100644
+--- a/tests/gateway/test_session_api.py
++++ b/tests/gateway/test_session_api.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import json
++import os
+ from unittest.mock import AsyncMock, patch
+ 
+ import pytest
+@@ -9,7 +10,7 @@ from aiohttp import web
+ from aiohttp.test_utils import TestClient, TestServer
+ 
+ from gateway.config import PlatformConfig
+-from gateway.platforms.api_server import APIServerAdapter, ResponseStore
++from gateway.platforms.api_server import APIServerAdapter, ResponseStore, _workspace_id_for_repo
+ from hermes_state import SessionDB
+ 
+ 
+@@ -52,6 +53,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
+     app = web.Application()
+     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+     app.router.add_post("/v1/runs", adapter._handle_runs)
++    app.router.add_post("/v1/sessions", adapter._handle_create_unified_session)
+     app.router.add_get("/v1/sessions/active", adapter._handle_list_active_sessions)
+     app.router.add_get("/v1/sessions/{session_id}/state", adapter._handle_session_state)
+     app.router.add_get("/v1/sessions/{session_id}/items", adapter._handle_session_items)
+@@ -236,6 +238,97 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert session_db.get_session(session_id) is None
+ 
+ 
++@pytest.mark.asyncio
++async def test_api_session_create_stores_runtime_model_metadata(adapter, session_db, monkeypatch):
++    """Legacy /api/sessions must store actual runtime config, not advertised model id."""
++    adapter._model_name = "advertised-gpt-5.5"
++    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda config=None: "glm-5.2")
++    monkeypatch.setattr(
++        "gateway.run._resolve_runtime_agent_kwargs",
++        lambda: {
++            "provider": "zai",
++            "base_url": "https://api.z.ai/api/paas/v4/",
++            "api_mode": "chat_completions",
++            "api_key": "sk-secret",
++            "credential_pool": {"token": "secret"},
++            "command": "secret-command",
++            "args": ["--token", "secret"],
++        },
++    )
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post("/api/sessions", json={"id": "runtime-session"})
++        assert resp.status == 201, await resp.text()
++
++    stored = session_db.get_session("runtime-session")
++    assert stored["model"] == "glm-5.2"
++    metadata = json.loads(stored["model_config"])
++    assert metadata == {
++        "model": "glm-5.2",
++        "provider": "zai",
++        "base_url": "https://api.z.ai/api/paas/v4/",
++        "api_mode": "chat_completions",
++    }
++
++
++@pytest.mark.asyncio
++async def test_unified_session_create_paths_store_runtime_model_metadata(adapter, session_db, tmp_path, monkeypatch):
++    """Both /v1/sessions chat and worktree creation paths persist safe runtime metadata."""
++    repo_path = tmp_path / "repo"
++    repo_path.mkdir()
++    worktrees_path = tmp_path / "worktrees"
++    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda config=None: "glm-5.2")
++    monkeypatch.setattr(
++        "gateway.run._resolve_runtime_agent_kwargs",
++        lambda: {
++            "provider": "zai",
++            "base_url": "https://api.z.ai/api/paas/v4/",
++            "api_mode": "chat_completions",
++            "api_key": "sk-secret",
++        },
++    )
++    monkeypatch.setattr(
++        "gateway.platforms.api_server._workspace_payload",
++        lambda _path: {
++            "id": "local-workspace",
++            "repoPath": str(repo_path),
++            "worktreesPath": str(worktrees_path),
++            "defaultBranch": "main",
++        },
++    )
++    monkeypatch.setattr(adapter, "_create_git_worktree", lambda *_args, **_kwargs: None)
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        chat_resp = await cli.post("/v1/sessions", json={"id": "unified-chat", "type": "chat"})
++        assert chat_resp.status == 201, await chat_resp.text()
++        worktree_resp = await cli.post(
++            "/v1/sessions",
++            json={
++                "id": "unified-worktree",
++                "type": "worktree",
++                "workspace": _workspace_id_for_repo(repo_path),
++                "branchName": "feature-runtime-model",
++            },
++        )
++        assert worktree_resp.status == 201, await worktree_resp.text()
++
++    for session_id in ("unified-chat", "unified-worktree"):
++        stored = session_db.get_session(session_id)
++        assert stored["model"] == "glm-5.2"
++        metadata = json.loads(stored["model_config"])
++        assert metadata["model"] == "glm-5.2"
++        assert metadata["provider"] == "zai"
++        assert metadata["base_url"] == "https://api.z.ai/api/paas/v4/"
++        assert metadata["api_mode"] == "chat_completions"
++        assert "api_key" not in metadata
++        assert "credential_pool" not in metadata
++        assert "command" not in metadata
++        assert "args" not in metadata
++    assert "nako_worktree" in json.loads(session_db.get_session("unified-worktree")["model_config"])
++
++
+ @pytest.mark.asyncio
+ async def test_session_patch_archives_and_unarchives(adapter, session_db):
+     session_id = session_db.create_session("archive-session", "api_server")
+@@ -459,12 +552,78 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
+     assert kwargs["user_message"] == expected_user_message
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_chat_restores_stored_model_override_on_future_turns(auth_adapter, session_db, monkeypatch):
++    """A session-scoped /model choice should be restored for later API chat turns."""
++    session_id = session_db.create_session(
++        "stored-override-session",
++        "api_server",
++        model="glm-5.2",
++        model_config={
++            "model": "glm-5.2",
++            "provider": "zai",
++            "base_url": "https://api.z.ai/api/paas/v4/",
++            "api_mode": "chat_completions",
++        },
++    )
++    seen = {}
++
++    class FakeAgent:
++        session_prompt_tokens = 0
++        session_completion_tokens = 0
++        session_total_tokens = 0
++
++        def __init__(self, session_id):
++            self.session_id = session_id
++
++        def run_conversation(self, user_message, conversation_history, task_id):
++            return {"final_response": "ok", "messages": []}
++
++    def fake_create_agent(**kwargs):
++        seen["request_model_override"] = kwargs.get("request_model_override")
++        return FakeAgent(kwargs["session_id"])
++
++    monkeypatch.setattr(auth_adapter, "_create_agent", fake_create_agent)
++    monkeypatch.setattr(
++        "hermes_cli.runtime_provider.resolve_runtime_provider",
++        lambda requested=None, target_model=None: {
++            "provider": requested,
++            "base_url": "https://api.z.ai/api/paas/v4/",
++            "api_mode": "chat_completions",
++            "api_key": "sk-secret",
++        },
++    )
++
++    app = _create_session_app(auth_adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.post(
++            f"/api/sessions/{session_id}/chat",
++            json={"message": "continue"},
++            headers={"Authorization": "Bearer sk-test"},
++        )
++        assert resp.status == 200, await resp.text()
++
++    override = seen["request_model_override"]
++    assert override["model"] == "glm-5.2"
++    assert override["provider"] == "zai"
++    assert override["runtime"]["provider"] == "zai"
++    assert override["runtime"]["base_url"] == "https://api.z.ai/api/paas/v4/"
++    assert override["runtime"]["api_mode"] == "chat_completions"
++
++
+ @pytest.mark.asyncio
+ async def test_session_chat_process_commands_switches_model_without_agent_turn(
+     auth_adapter, session_db, monkeypatch
+ ):
+     """Opt-in command processing lets API clients use /model as control-plane input."""
+     session_id = session_db.create_session("command-session", "api_server", model="old-model")
++    other_session_id = session_db.create_session(
++        "other-command-session",
++        "api_server",
++        model="other-model",
++        model_config={"model": "other-model", "provider": "other-provider"},
++    )
++    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "global-model-before")
+ 
+     from hermes_cli.model_switch import ModelSwitchResult
+ 
+@@ -511,6 +670,15 @@ async def test_session_chat_process_commands_switches_model_without_agent_turn(
+     assert model_config["provider"] == "openrouter"
+     assert model_config["base_url"] == "https://openrouter.ai/api/v1"
+     assert "api_key" not in model_config
++    assert "credential_pool" not in model_config
++    assert "command" not in model_config
++    assert "args" not in model_config
++    assert session_db.get_session(other_session_id)["model"] == "other-model"
++    assert json.loads(session_db.get_session(other_session_id)["model_config"]) == {
++        "model": "other-model",
++        "provider": "other-provider",
++    }
++    assert os.environ["HERMES_INFERENCE_MODEL"] == "global-model-before"
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.50.1 (Apple Git-155)
+
