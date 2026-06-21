@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Sat, 20 Jun 2026 20:51:55 -0700
+Subject: [PATCH 9/9] feat(api): add live session sync subscription
+
+Add a session subscribe SSE endpoint that emits a snapshot, catch-up
+state, and replayable live run events for clients that drop into an
+existing API session. Also expose lightweight live state on session list
+and detail responses so clients can show active work without N+1 calls.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/docs/api-session-sync-handoff.md b/docs/api-session-sync-handoff.md
+new file mode 100644
+index 000000000..b526e9344
+--- /dev/null
++++ b/docs/api-session-sync-handoff.md
+@@ -0,0 +1,189 @@
++# API session sync handoff
++
++This document describes the Hermes API-server surfaces a desktop/mobile/web client can use to keep multiple clients synchronized with the same live Hermes session.
++
++## Goals covered
++
++- Re-open a session after app close/tab switch/device switch.
++- Receive current persisted history immediately.
++- Join a session while a run is already streaming and catch up on missed deltas/tool events.
++- Keep more than one client attached without stealing events from the initiating client.
++- Resume after reconnect from durable cursors.
++
++## Primary endpoint: session subscription SSE
++
++```http
++GET /api/sessions/{session_id}/subscribe
++Authorization: Bearer <API_SERVER_KEY>
++```
++
++For browser `EventSource`, where custom headers are awkward, the API server also accepts query-token auth:
++
++```http
++GET /api/sessions/{session_id}/subscribe?access_token=<API_SERVER_KEY>
++```
++
++The response is `text/event-stream`. The first event is always `session.snapshot`.
++
++```text
++event: session.snapshot
++data: { ...snapshot... }
++```
++
++Snapshot shape:
++
++```json
++{
++  "object": "hermes.session.snapshot",
++  "session_id": "api_...",
++  "session": { "id": "api_...", "title": "...", "message_count": 2, "...": "..." },
++  "messages": [
++    { "id": 1, "role": "user", "content": "...", "items": [...] },
++    { "id": 2, "role": "assistant", "content": "...", "items": [...] }
++  ],
++  "items": [
++    { "id": "msg:1", "type": "message", "role": "user", "content": "..." }
++  ],
++  "latest_event_cursor": "123",
++  "active_run": {
++    "object": "hermes.session.run",
++    "run_id": "run_...",
++    "session_id": "api_...",
++    "status": "running",
++    "last_seq": 4,
++    "draft": "partial assistant text",
++    "reasoning": "partial reasoning/tool progress text",
++    "tool_status": "terminal…"
++  }
++}
++```
++
++After the snapshot, the stream emits two kinds of catch-up/live events:
++
++1. Durable session events from `state.db` (`session.item.upserted`, `run.completed`, etc.). These carry a global `cursor` field.
++2. Replayable active-run events from `response_store.db` (`run.started`, `message.started`, `assistant.delta`, `tool.progress`, `tool.started`, `tool.completed`, `assistant.completed`, `run.completed`, `done`, `error`). These carry a per-run integer `seq` field.
++
++Example run event:
++
++```text
++event: assistant.delta
++data: {"run_id":"run_...","session_id":"api_...","seq":3,"message_id":"msg_...","delta":"hello"}
++```
++
++When the latest run for a session changes while the subscription is open, the stream emits:
++
++```text
++event: run.switch
++data: {"session_id":"api_...","run":{...new run snapshot...}}
++```
++
++The client should reset its per-run `seq` cursor to `0` for that new `run_id`, then apply subsequent run events normally.
++
++## Resume / reconnect cursors
++
++The endpoint accepts independent cursors:
++
++```http
++GET /api/sessions/{session_id}/subscribe?after=<session_event_cursor>&run_after=<last_run_seq>
++```
++
++Aliases:
++
++- `cursor` is accepted as an alias for `after`.
++- `after_seq` is accepted as an alias for `run_after`.
++
++Recommended client state to persist per session:
++
++```json
++{
++  "session_id": "api_...",
++  "session_event_cursor": "123",
++  "run_id": "run_...",
++  "run_seq": 7
++}
++```
++
++On reconnect:
++
++1. Open `/api/sessions/{session_id}/subscribe?after=<session_event_cursor>&run_after=<run_seq>`.
++2. Replace/merge local session metadata/history from `session.snapshot`.
++3. Apply all subsequent events in order.
++4. Update `session_event_cursor` whenever an event has `cursor`.
++5. Update `run_id`/`run_seq` whenever a run event has `run_id`/`seq`.
++6. If `run.switch` arrives, replace `run_id` with the new run and reset `run_seq` to `0` before applying new run events.
++
++If no `after` cursor is supplied, Hermes treats the snapshot as the history catch-up point and starts durable session events from the snapshot-time cursor. This avoids duplicating old persisted messages that are already present in `messages`/`items`. Active-run events still replay from `run_after` (default `0`) so a mid-stream subscriber catches the current assistant deltas.
++
++## Starting work in a session
++
++Use the persisted session stream endpoint to start a turn:
++
++```http
++POST /api/sessions/{session_id}/chat/stream
++Content-Type: application/json
++Authorization: Bearer <API_SERVER_KEY>
++
++{"message":"do the task"}
++```
++
++The initiating client may consume that response directly, but it does not have to be the only consumer. Any other client can call `/api/sessions/{session_id}/subscribe` and receive the same replayable active-run events from durable storage.
++
++For non-initiating clients:
++
++1. Connect to `/api/sessions/{session_id}/subscribe`.
++2. Render `session.snapshot.messages` immediately.
++3. If `session.snapshot.active_run.status` is `queued` or `running`, keep rendering incoming `assistant.delta`/tool/run events.
++
++## Existing companion endpoints
++
++These remain useful for focused workflows:
++
++- `GET /api/sessions` — list sessions. Each row includes lightweight live state:
++  - `active`: true only when Hermes is actively processing/queued/stopping for that session.
++  - `status`: `processing`, `idle`, `interrupted`, `completed`, etc.
++  - `sync_state`: detailed session state plus pending tool-call ids and cursor.
++  - `active_run`: the current queued/running/waiting/stopping run snapshot, or `null`.
++- `POST /api/sessions` — create an empty session.
++- `GET /api/sessions/{session_id}` — session metadata with the same live-state fields as the list row.
++- `GET /api/sessions/{session_id}/messages` — persisted message history only.
++- `GET /api/sessions/{session_id}/active-run` — latest run snapshot only.
++- `GET /api/session-runs/{run_id}/events?after=<seq>` — per-run replay SSE when a client already knows the run id.
++- `GET /v1/sessions/{session_id}/items` — stable item projection.
++- `GET /v1/sessions/{session_id}/events?after=<cursor>` — durable session-event replay only.
++- `GET /v1/session_events/firehose` — websocket firehose for global sync/replication consumers.
++- `POST /v1/session_events/ack` — acknowledge global firehose cursor after an external consumer durably stores events.
++
++## Client rendering notes
++
++- Treat `messages` in `session.snapshot` as the authoritative persisted transcript at attach time.
++- Treat `items` as the normalized render model for message/tool-call/tool-result display.
++- Accumulate `assistant.delta` events by `message_id` for the current in-progress assistant draft.
++- On `assistant.completed`, replace the draft with the completed content.
++- On `run.completed`, reconcile with `messages` in that payload if present; Hermes includes the interleaved assistant/tool transcript for the completed turn when available.
++- Tool events may arrive as both renderable run events (`tool.progress`, `tool.started`, `tool.completed`) and durable item upserts (`session.item.upserted`) depending on the path. Use stable item ids and tool_call ids to de-dupe.
++
++## Implementation pointers
++
++- API-server adapter: `gateway/platforms/api_server.py`
++  - `_handle_session_subscribe` implements the new snapshot + live SSE endpoint.
++  - `_handle_session_chat_stream` persists replayable per-run events into `ResponseStore.session_run_events`.
++  - `_record_live_tool_session_item` publishes provisional tool call/result item upserts into `SessionDB.session_events`.
++- Durable stores:
++  - `hermes_state.py` / `SessionDB.session_events` for session items and global cursor-based sync.
++  - `ResponseStore.session_runs` and `ResponseStore.session_run_events` in `response_store.db` for per-run assistant deltas and run lifecycle replay.
++- Capability discovery:
++  - `GET /v1/capabilities` advertises `features.session_subscribe_sse: true` and `endpoints.session_subscribe`.
++
++## Verified behavior
++
++Regression coverage lives in `tests/gateway/test_session_api.py`:
++
++- `test_session_subscribe_sends_snapshot_and_replays_active_run`
++- `test_session_subscribe_streams_events_written_after_connect`
++- Existing session chat stream/replay tests cover durable run events and active-run snapshots.
++
++Verified with:
++
++```bash
++scripts/run_tests.sh tests/gateway/test_session_api.py
++```
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 72e2b0c84..69b75b65c 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1604,6 +1604,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_chat": True,
+                 "session_chat_streaming": True,
+                 "session_run_replay": True,
++                "session_subscribe_sse": True,
+                 "session_fork": True,
+                 "unified_session_create": True,
+                 "workspace_resources": True,
+@@ -1638,6 +1639,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
+                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
+                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
++                "session_subscribe": {"method": "GET", "path": "/api/sessions/{session_id}/subscribe"},
+                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+@@ -2028,6 +2030,42 @@ class APIServerAdapter(BasePlatformAdapter):
+             payload["active"] = True
+         return payload
+ 
++    def _session_response_with_activity(self, session: Dict[str, Any]) -> Dict[str, Any]:
++        """Return session metadata plus lightweight live-run state for clients."""
++        payload = self._session_response(session)
++        session_id = str(session.get("id") or payload.get("id") or "")
++        db = self._ensure_session_db()
++        stored_state = None
++        latest_event_cursor = None
++        if db is not None and session_id:
++            try:
++                stored_state = db.get_session_sync_state(session_id)
++                latest_event_cursor = db.latest_session_event_cursor(session_id)
++            except Exception:
++                stored_state = session.get("sync_state") if isinstance(session.get("sync_state"), dict) else None
++        else:
++            stored_state = session.get("sync_state") if isinstance(session.get("sync_state"), dict) else None
++        sync_state = self._live_session_state(session_id, stored_state)
++        latest_run = self._response_store.get_latest_session_run(session_id) if session_id else None
++        run_is_active = bool(
++            latest_run
++            and latest_run.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
++        )
++        if run_is_active:
++            sync_state["state"] = "processing"
++            sync_state["status"] = "processing"
++            sync_state["active"] = True
++            payload["active_run"] = latest_run
++        else:
++            payload["active_run"] = None
++            if sync_state.get("state") == "idle":
++                sync_state["active"] = False
++        payload["sync_state"] = sync_state
++        payload["active"] = bool(run_is_active or sync_state.get("state") == "processing")
++        payload["status"] = str(sync_state.get("status") or sync_state.get("state") or "idle")
++        payload["latest_event_cursor"] = latest_event_cursor
++        return payload
++
+     def _record_response_session_event(
+         self,
+         *,
+@@ -2320,7 +2358,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         )
+         return web.json_response({
+             "object": "list",
+-            "data": [self._session_response(s) for s in sessions],
++            "data": [self._session_response_with_activity(s) for s in sessions],
+             "limit": limit,
+             "offset": offset,
+             "has_more": len(sessions) == limit,
+@@ -2371,7 +2409,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         session, err = self._get_existing_session_or_404(request.match_info["session_id"])
+         if err:
+             return err
+-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
++        return web.json_response({"object": "hermes.session", "session": self._session_response_with_activity(session)})
+ 
+     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
+         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
+@@ -2535,6 +2573,97 @@ class APIServerAdapter(BasePlatformAdapter):
+             logger.debug("[api_server] session run replay stream error for %s: %s", run_id, exc)
+         return response
+ 
++    async def _handle_session_subscribe(self, request: "web.Request") -> "web.StreamResponse":
++        """GET /api/sessions/{session_id}/subscribe — snapshot + live SSE."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        session, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++
++        resolved_id = db.resolve_resume_session_id(session_id)
++        resolved_session = db.get_session(resolved_id) or session
++        explicit_cursor = request.query.get("after") or request.query.get("cursor")
++        session_cursor = explicit_cursor or db.latest_session_event_cursor(resolved_id) or "0"
++        try:
++            run_after = int(request.query.get("run_after") or request.query.get("after_seq") or "0")
++        except ValueError:
++            return web.json_response(_openai_error("run_after must be an integer", code="invalid_run_after"), status=400)
++        once = _coerce_request_bool(request.query.get("once"), default=False)
++
++        headers = {
++            "Content-Type": "text/event-stream",
++            "Cache-Control": "no-cache",
++            "X-Accel-Buffering": "no",
++            "X-Hermes-Session-Id": resolved_id,
++        }
++        origin = request.headers.get("Origin", "")
++        cors = self._cors_headers_for_origin(origin) if origin else None
++        if cors:
++            headers.update(cors)
++        response = web.StreamResponse(status=200, headers=headers)
++        await response.prepare(request)
++
++        async def _write_event(event_name: str, payload: Dict[str, Any]) -> None:
++            data = json.dumps(payload, ensure_ascii=False)
++            await response.write(f"event: {event_name}\ndata: {data}\n\n".encode("utf-8"))
++
++        latest_run = self._response_store.get_latest_session_run(resolved_id)
++        snapshot = {
++            "object": "hermes.session.snapshot",
++            "session_id": resolved_id,
++            "session": self._session_response(resolved_session),
++            "messages": [self._message_response(m) for m in db.get_messages(resolved_id)],
++            "items": db.get_session_items(resolved_id),
++            "latest_event_cursor": db.latest_session_event_cursor(resolved_id),
++            "active_run": latest_run,
++        }
++        active_run_id = latest_run.get("run_id") if latest_run else None
++        active_run_seq = run_after
++        last_activity = time.monotonic()
++
++        try:
++            await _write_event("session.snapshot", snapshot)
++            while True:
++                wrote = False
++                for event in db.list_session_events(session_id=resolved_id, after=session_cursor, limit=100):
++                    await _write_event(str(event.get("event_type") or "session.event"), event)
++                    session_cursor = event.get("cursor") or session_cursor
++                    wrote = True
++
++                latest_run = self._response_store.get_latest_session_run(resolved_id)
++                latest_run_id = latest_run.get("run_id") if latest_run else None
++                if latest_run_id and latest_run_id != active_run_id:
++                    active_run_id = latest_run_id
++                    active_run_seq = 0
++                    await _write_event("run.switch", {"session_id": resolved_id, "run": latest_run})
++                    wrote = True
++                if active_run_id:
++                    for item in self._response_store.list_session_run_events(active_run_id, after=active_run_seq):
++                        payload = item.get("payload") or {}
++                        active_run_seq = max(active_run_seq, int(payload.get("seq") or active_run_seq))
++                        await _write_event(str(item.get("event") or "run.event"), payload)
++                        wrote = True
++
++                if once:
++                    break
++                if wrote:
++                    last_activity = time.monotonic()
++                elif time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
++                    await response.write(b": keepalive\n\n")
++                    last_activity = time.monotonic()
++                await asyncio.sleep(0.5)
++        except (asyncio.CancelledError, ConnectionResetError):
++            raise
++        except Exception as exc:
++            logger.debug("[api_server] session subscribe stream error for %s: %s", resolved_id, exc)
++        return response
++
+     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
+         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+         auth_err = self._check_auth(request)
+@@ -5881,6 +6010,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
+             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
++            self._app.router.add_get("/api/sessions/{session_id}/subscribe", self._handle_session_subscribe)
+             self._app.router.add_get("/api/sessions/{session_id}/active-run", self._handle_session_active_run)
+             self._app.router.add_get("/api/session-runs/{run_id}/events", self._handle_session_run_events)
+             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
+index c1a78c4c1..11f08c47e 100644
+--- a/tests/gateway/test_session_api.py
++++ b/tests/gateway/test_session_api.py
+@@ -63,6 +63,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
+     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
+     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
+     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
++    app.router.add_get("/api/sessions/{session_id}/subscribe", adapter._handle_session_subscribe)
+     app.router.add_get("/api/sessions/{session_id}/active-run", adapter._handle_session_active_run)
+     app.router.add_get("/api/session-runs/{run_id}/events", adapter._handle_session_run_events)
+     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+@@ -100,6 +101,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+     assert features["session_chat"] is True
+     assert features["session_chat_streaming"] is True
+     assert features["session_run_replay"] is True
++    assert features["session_subscribe_sse"] is True
+     assert features["session_fork"] is True
+     assert features["admin_config_rw"] is False
+     assert features["memory_write_api"] is False
+@@ -114,6 +116,10 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+         "method": "GET",
+         "path": "/api/sessions/{session_id}/active-run",
+     }
++    assert data["endpoints"]["session_subscribe"] == {
++        "method": "GET",
++        "path": "/api/sessions/{session_id}/subscribe",
++    }
+     assert data["endpoints"]["session_run_events"] == {
+         "method": "GET",
+         "path": "/api/session-runs/{run_id}/events",
+@@ -196,6 +202,9 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert listed["object"] == "list"
+         assert [s["id"] for s in listed["data"]] == [session_id]
+         assert listed["data"][0]["message_count"] == 2
++        assert listed["data"][0]["active"] is False
++        assert listed["data"][0]["status"] == "idle"
++        assert listed["data"][0]["active_run"] is None
+ 
+         get_resp = await cli.get(f"/api/sessions/{session_id}")
+         assert get_resp.status == 200
+@@ -216,6 +225,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         patched = await patch_resp.json()
+         assert patched["session"]["title"] == "Renamed"
+ 
++
+         delete_resp = await cli.delete(f"/api/sessions/{session_id}")
+         assert delete_resp.status == 200
+         deleted = await delete_resp.json()
+@@ -223,6 +233,32 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert session_db.get_session(session_id) is None
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_list_and_get_include_active_run_state(adapter, session_db):
++    session_id = session_db.create_session("active-list-session", "api_server")
++    adapter._response_store.create_session_run("run_active_list", session_id, "still working")
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        list_resp = await cli.get("/api/sessions?limit=10&offset=0")
++        assert list_resp.status == 200
++        listed = await list_resp.json()
++        item = listed["data"][0]
++
++        get_resp = await cli.get(f"/api/sessions/{session_id}")
++        assert get_resp.status == 200
++        got = await get_resp.json()
++
++    for payload in (item, got["session"]):
++        assert payload["id"] == session_id
++        assert payload["active"] is True
++        assert payload["status"] == "processing"
++        assert payload["sync_state"]["active"] is True
++        assert payload["sync_state"]["state"] == "processing"
++        assert payload["active_run"]["run_id"] == "run_active_list"
++        assert payload["active_run"]["status"] == "queued"
++
++
+ @pytest.mark.asyncio
+ async def test_session_messages_follow_compression_tip(adapter, session_db):
+     source_id = session_db.create_session("source-session", "api_server")
+@@ -777,6 +813,88 @@ async def test_session_chat_stream_persists_replayable_run_state(adapter, sessio
+     assert run_id in body
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_subscribe_sends_snapshot_and_replays_active_run(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("subscribe-session", "api_server")
++    session_db.append_message(session_id, "user", "existing prompt")
++    session_db.append_message(session_id, "assistant", "existing answer")
++    adapter._response_store.create_session_run("run_subscribe", session_id, "live prompt")
++    adapter._response_store.put_session_run_event("run_subscribe", "run.started", {"status": "running"})
++    adapter._response_store.put_session_run_event(
++        "run_subscribe",
++        "assistant.delta",
++        {"message_id": "msg_live", "delta": "live delta"},
++    )
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.get(f"/api/sessions/{session_id}/subscribe?once=true")
++        assert resp.status == 200
++        body = await resp.text()
++
++    events = []
++    for block in body.split("\n\n"):
++        if not block.strip() or block.startswith(":"):
++            continue
++        event_name = None
++        data = None
++        for line in block.splitlines():
++            if line.startswith("event: "):
++                event_name = line[len("event: "):]
++            elif line.startswith("data: "):
++                data = _json.loads(line[len("data: "):])
++        if event_name and data is not None:
++            events.append((event_name, data))
++
++    assert events[0][0] == "session.snapshot"
++    snapshot = events[0][1]
++    assert snapshot["session"]["id"] == session_id
++    assert [m["content"] for m in snapshot["messages"]] == ["existing prompt", "existing answer"]
++    assert snapshot["active_run"]["run_id"] == "run_subscribe"
++    assert [name for name, _ in events][1:] == ["run.started", "assistant.delta"]
++    assert events[-1][1]["delta"] == "live delta"
++
++
++@pytest.mark.asyncio
++async def test_session_subscribe_streams_events_written_after_connect(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("subscribe-live-session", "api_server")
++    adapter._response_store.create_session_run("run_live_subscribe", session_id, "live prompt")
++    adapter._response_store.put_session_run_event("run_live_subscribe", "run.started", {"status": "running"})
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.get(f"/api/sessions/{session_id}/subscribe")
++        assert resp.status == 200
++
++        adapter._response_store.put_session_run_event(
++            "run_live_subscribe",
++            "assistant.delta",
++            {"message_id": "msg_live", "delta": "arrived after subscribe"},
++        )
++        adapter._response_store.put_session_run_event(
++            "run_live_subscribe",
++            "run.completed",
++            {"message_id": "msg_live", "completed": True},
++        )
++
++        seen_delta = None
++        for _ in range(160):
++            line = await asyncio.wait_for(resp.content.readline(), timeout=2)
++            if not line:
++                break
++            if line.startswith(b"data: "):
++                payload = _json.loads(line[len(b"data: "):])
++                if payload.get("delta") == "arrived after subscribe":
++                    seen_delta = payload
++                    break
++
++    assert seen_delta is not None
++
++
+ def test_response_store_marks_incomplete_session_runs_interrupted_after_restart(tmp_path):
+     db_path = tmp_path / "response_store.db"
+     store = ResponseStore(db_path=str(db_path))
+-- 
+2.50.1 (Apple Git-155)
+
