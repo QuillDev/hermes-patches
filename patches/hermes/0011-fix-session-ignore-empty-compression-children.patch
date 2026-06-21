@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 22:12:22 -0700
-Subject: [PATCH 11/12] fix(session): ignore empty compression children
+Subject: [PATCH 11/13] fix(session): ignore empty compression children
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 

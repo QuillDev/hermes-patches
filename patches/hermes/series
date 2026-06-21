@@ -10,3 +10,4 @@
 0010-feat-api-support-session-archiving-over-HTTP.patch
 0011-fix-session-ignore-empty-compression-children.patch
 0012-feat-api-process-session-slash-commands.patch
+0013-fix-session-preserve-runtime-metadata-and-archive-st.patch
