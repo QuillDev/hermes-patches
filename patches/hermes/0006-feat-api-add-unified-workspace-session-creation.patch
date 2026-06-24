@@ -6,7 +6,7 @@ Subject: [PATCH 06/15] feat(api): add unified workspace session creation
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 07717f74a..72e2b0c84 100644
+index c31618dce..5f45c2c08 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -32,6 +32,7 @@ Requires:
@@ -115,7 +115,7 @@ index 07717f74a..72e2b0c84 100644
  def _normalize_chat_content(
      content: Any, *, _max_depth: int = 10, _depth: int = 0,
  ) -> str:
-@@ -1527,6 +1605,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1589,6 +1667,8 @@ class APIServerAdapter(BasePlatformAdapter):
                  "session_chat_streaming": True,
                  "session_run_replay": True,
                  "session_fork": True,
@@ -124,7 +124,7 @@ index 07717f74a..72e2b0c84 100644
                  "admin_config_rw": False,
                  "jobs_admin": False,
                  "memory_write_api": False,
-@@ -1550,6 +1630,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1612,6 +1692,8 @@ class APIServerAdapter(BasePlatformAdapter):
                  "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                  "skills": {"method": "GET", "path": "/v1/skills"},
                  "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -133,7 +133,7 @@ index 07717f74a..72e2b0c84 100644
                  "sessions": {"method": "GET", "path": "/api/sessions"},
                  "session_create": {"method": "POST", "path": "/api/sessions"},
                  "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
-@@ -1673,10 +1755,24 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1735,10 +1817,24 @@ class APIServerAdapter(BasePlatformAdapter):
              "end_reason", "message_count", "tool_call_count", "input_tokens",
              "output_tokens", "cache_read_tokens", "cache_write_tokens",
              "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
@@ -159,7 +159,7 @@ index 07717f74a..72e2b0c84 100644
          # Avoid exposing full system prompts/model_config through the client API;
          # callers only need to know whether those snapshots exist.
          payload["has_system_prompt"] = bool(session.get("system_prompt"))
-@@ -1707,6 +1803,179 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1769,6 +1865,179 @@ class APIServerAdapter(BasePlatformAdapter):
              return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
          return body, None
  
@@ -339,7 +339,7 @@ index 07717f74a..72e2b0c84 100644
      def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
          db = self._ensure_session_db()
          if db is None:
-@@ -1726,6 +1995,20 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1788,6 +2057,20 @@ class APIServerAdapter(BasePlatformAdapter):
              logger.warning("Failed to load session history for %s: %s", session_id, exc)
              return []
  
@@ -360,7 +360,7 @@ index 07717f74a..72e2b0c84 100644
      def _live_session_state(self, session_id: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
          payload = dict(state or {
              "object": "hermes.session.state",
-@@ -4775,6 +5058,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4905,6 +5188,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  chat_id=session_id or "",
                  session_key=gateway_session_key or session_id or "",
                  session_id=session_id or "",
@@ -368,7 +368,7 @@ index 07717f74a..72e2b0c84 100644
              )
              try:
                  agent = self._create_agent(
-@@ -5582,6 +5866,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5721,6 +6005,8 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
              self._app.router.add_get("/v1/skills", self._handle_skills)
              self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
@@ -378,7 +378,7 @@ index 07717f74a..72e2b0c84 100644
              self._app.router.add_get("/v1/sessions/active", self._handle_list_active_sessions)
              self._app.router.add_get("/v1/sessions/{session_id}/state", self._handle_session_state)
 diff --git a/tests/gateway/test_api_server.py b/tests/gateway/test_api_server.py
-index 31c2ef1c1..ead0031c3 100644
+index 01474fdf4..ae7aaa143 100644
 --- a/tests/gateway/test_api_server.py
 +++ b/tests/gateway/test_api_server.py
 @@ -16,6 +16,7 @@ import asyncio
@@ -389,7 +389,7 @@ index 31c2ef1c1..ead0031c3 100644
  import time
  import uuid
  from unittest.mock import AsyncMock, MagicMock, patch
-@@ -494,6 +495,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
+@@ -551,6 +552,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
      app.router.add_get("/v1/health", adapter._handle_health)
      app.router.add_get("/v1/models", adapter._handle_models)
      app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
@@ -398,7 +398,7 @@ index 31c2ef1c1..ead0031c3 100644
      app.router.add_get("/v1/skills", adapter._handle_skills)
      app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
      app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
-@@ -515,6 +518,39 @@ def auth_adapter():
+@@ -572,6 +575,39 @@ def auth_adapter():
      return _make_adapter(api_key="sk-secret")
  
  
@@ -438,7 +438,7 @@ index 31c2ef1c1..ead0031c3 100644
  # ---------------------------------------------------------------------------
  # Adapter internals
  # ---------------------------------------------------------------------------
-@@ -549,6 +585,39 @@ class TestAgentExecution:
+@@ -606,6 +642,39 @@ class TestAgentExecution:
              task_id="session-123",
          )
  
@@ -478,7 +478,7 @@ index 31c2ef1c1..ead0031c3 100644
      @pytest.mark.asyncio
      async def test_run_agent_threads_request_model_override_to_create_agent(self, adapter):
          mock_agent = MagicMock()
-@@ -640,6 +709,100 @@ class TestAgentExecution:
+@@ -697,6 +766,100 @@ class TestAgentExecution:
          assert captured["switch"]["explicit_provider"] == "openai"
  
  

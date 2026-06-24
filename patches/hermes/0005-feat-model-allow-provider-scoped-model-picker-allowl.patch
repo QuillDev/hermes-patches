@@ -11,7 +11,7 @@ The policy is picker-only: explicit /model switches remain available for power u
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
-index 7f0d3d220..a5ed79f1c 100644
+index eefc7479f..215e16450 100644
 --- a/hermes_cli/inventory.py
 +++ b/hermes_cli/inventory.py
 @@ -76,6 +76,17 @@ class ConfigContext:
@@ -157,7 +157,7 @@ index 7f0d3d220..a5ed79f1c 100644
  # ─── Public: payload builder ────────────────────────────────────────────
  
  
-@@ -203,6 +332,17 @@ def build_models_payload(
+@@ -210,6 +339,17 @@ def build_models_payload(
  
      if include_unconfigured:
          rows = list(rows) + _append_unconfigured_rows(rows, ctx)
@@ -175,7 +175,7 @@ index 7f0d3d220..a5ed79f1c 100644
      if picker_hints:
          _apply_picker_hints(rows)
      if canonical_order:
-@@ -212,11 +352,14 @@ def build_models_payload(
+@@ -219,11 +359,14 @@ def build_models_payload(
      if capabilities:
          _apply_capabilities(rows)
  
@@ -192,7 +192,7 @@ index 7f0d3d220..a5ed79f1c 100644
  
  def _apply_capabilities(rows: list[dict]) -> None:
 diff --git a/tests/hermes_cli/test_inventory.py b/tests/hermes_cli/test_inventory.py
-index 2eff7bd46..a3262c645 100644
+index af65f90a3..a8d384ca8 100644
 --- a/tests/hermes_cli/test_inventory.py
 +++ b/tests/hermes_cli/test_inventory.py
 @@ -168,6 +168,70 @@ def test_build_models_payload_returns_expected_shape():

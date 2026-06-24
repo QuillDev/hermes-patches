@@ -6,13 +6,22 @@ Subject: [PATCH 07/15] fix(photon): auto-recover wedged sidecar streams
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
-index 01c1cabbc..85a5c7ce4 100644
+index d025b8e3d..1c2ed8ead 100644
 --- a/plugins/platforms/photon/adapter.py
 +++ b/plugins/platforms/photon/adapter.py
-@@ -85,6 +85,16 @@ _DEDUP_WINDOW_SECONDS = 48 * 3600
+@@ -85,6 +85,7 @@ _DEDUP_WINDOW_SECONDS = 48 * 3600
  
  _SIDECAR_DIR = Path(__file__).parent / "sidecar"
  
++
+ # Photon / Envoy / spectrum-ts error substrings that indicate a transient
+ # upstream overload rather than a permanent failure.  These are not in the
+ # core _RETRYABLE_ERROR_PATTERNS because they are specific to this adapter.
+@@ -99,6 +100,18 @@ _PHOTON_RETRYABLE_PATTERNS = (
+ # upstream gRPC pressure during Photon overflow events.
+ _TYPING_COOLDOWN_SECONDS = 5.0
+ 
++
 +# spectrum-ts retries internally when catch-up fails, so the loopback
 +# ``/inbound`` stream can stay open even though no iMessages are deliverable.
 +# Photon's wedged state shows up in sidecar stdout as RESOURCE_EXHAUSTED plus
@@ -23,10 +32,11 @@ index 01c1cabbc..85a5c7ce4 100644
 +    "catchupevents concurrency limit",
 +)
 +
++
  # Group-chat mention wake words. When ``require_mention`` is enabled, group
  # messages are ignored unless they match one of these patterns — same
  # behavior and defaults as the BlueBubbles iMessage channel so the two
-@@ -220,6 +230,7 @@ class PhotonAdapter(BasePlatformAdapter):
+@@ -234,6 +247,7 @@ class PhotonAdapter(BasePlatformAdapter):
          # Runtime state
          self._sidecar_proc: Optional[subprocess.Popen] = None
          self._sidecar_supervisor_task: Optional[asyncio.Task] = None
@@ -34,7 +44,7 @@ index 01c1cabbc..85a5c7ce4 100644
          self._inbound_task: Optional[asyncio.Task] = None
          self._inbound_running = False
          self._http_client: Optional["httpx.AsyncClient"] = None
-@@ -364,6 +375,15 @@ class PhotonAdapter(BasePlatformAdapter):
+@@ -380,6 +394,15 @@ class PhotonAdapter(BasePlatformAdapter):
  
      async def disconnect(self) -> None:
          self._inbound_running = False
@@ -50,7 +60,7 @@ index 01c1cabbc..85a5c7ce4 100644
          if self._inbound_task is not None:
              self._inbound_task.cancel()
              try:
-@@ -836,10 +856,57 @@ class PhotonAdapter(BasePlatformAdapter):
+@@ -852,7 +875,10 @@ class PhotonAdapter(BasePlatformAdapter):
                  line = await loop.run_in_executor(None, stdout.readline)
                  if not line:
                      break
@@ -61,6 +71,10 @@ index 01c1cabbc..85a5c7ce4 100644
 +                    self._schedule_sidecar_restart(text)
          except Exception as e:  # pragma: no cover - defensive
              logger.warning("[photon-sidecar] supervisor exited: %s", e)
+         if self._inbound_running:
+@@ -871,6 +897,50 @@ class PhotonAdapter(BasePlatformAdapter):
+             except Exception as exc:  # pragma: no cover - defensive
+                 logger.warning("[photon] fatal-error notification failed: %s", exc)
  
 +    @staticmethod
 +    def _sidecar_log_needs_restart(line: str) -> bool:

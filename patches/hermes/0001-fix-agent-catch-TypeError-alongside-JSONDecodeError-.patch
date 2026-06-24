@@ -11,7 +11,7 @@ JSONDecodeError. Catch both to avoid crashing the adapter.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 03e8b58e1..9d40d9a55 100644
+index c63c71da7..6b71de77e 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
 @@ -893,10 +893,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:

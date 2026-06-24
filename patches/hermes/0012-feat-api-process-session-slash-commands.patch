@@ -8,7 +8,7 @@ Add opt-in command handling for API session chat routes so /model can update the
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 6a4332eea..a9640b430 100644
+index 800fb62f2..6736ab0f2 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -481,6 +481,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
@@ -46,7 +46,7 @@ index 6a4332eea..a9640b430 100644
  def check_api_server_requirements() -> bool:
      """Check if API server dependencies are available."""
      return AIOHTTP_AVAILABLE
-@@ -1506,6 +1534,170 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1549,6 +1577,170 @@ class APIServerAdapter(BasePlatformAdapter):
                  status=400,
              )
  
@@ -217,7 +217,7 @@ index 6a4332eea..a9640b430 100644
      # ------------------------------------------------------------------
      # HTTP Handlers
      # ------------------------------------------------------------------
-@@ -2725,6 +2917,18 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2787,6 +2979,18 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -236,7 +236,7 @@ index 6a4332eea..a9640b430 100644
          history = self._conversation_history_for_session(session_id)
          result, usage = await self._run_agent(
              user_message=user_message,
-@@ -2773,6 +2977,39 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2835,6 +3039,39 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -276,7 +276,7 @@ index 6a4332eea..a9640b430 100644
  
          loop = asyncio.get_running_loop()
          queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
-@@ -5215,6 +5452,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5346,6 +5583,8 @@ class APIServerAdapter(BasePlatformAdapter):
          another thread to stop in-progress LLM calls.
          """
          loop = asyncio.get_running_loop()
@@ -284,7 +284,7 @@ index 6a4332eea..a9640b430 100644
 +            request_model_override = self._stored_session_model_override(session_id)
  
          def _run():
-             from gateway.session_context import clear_session_vars, set_session_vars
+             from gateway.session_context import clear_session_vars
 diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
 index b92231ac6..de85fb8c5 100644
 --- a/tests/gateway/test_session_api.py

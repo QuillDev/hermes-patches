@@ -714,10 +714,10 @@ index 000000000..46c669f0f
 +
 +    assert workflow["customOption"] is True
 diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
-index 101b000db..fa319dd83 100644
+index 81c6491f9..cf4512fd0 100644
 --- a/tools/image_generation_tool.py
 +++ b/tools/image_generation_tool.py
-@@ -1349,6 +1349,7 @@ def _dispatch_to_plugin_provider(
+@@ -1351,6 +1351,7 @@ def _dispatch_to_plugin_provider(
              norm_refs = normalize_reference_images(reference_image_urls)
          if norm_refs:
              kwargs["reference_image_urls"] = norm_refs

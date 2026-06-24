@@ -80,10 +80,10 @@ index 5a3c32417..067baa0f9 100644
      vi.useFakeTimers()
      const calls: { method: string; params?: Record<string, unknown> }[] = []
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-index f594d410c..bc541f620 100644
+index 92d5a5403..3288ebd19 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-@@ -75,6 +75,14 @@ interface HandoffResult {
+@@ -78,6 +78,14 @@ interface HandoffResult {
    error?: string
  }
  
@@ -98,7 +98,7 @@ index f594d410c..bc541f620 100644
  function delay(ms: number): Promise<void> {
    return new Promise(resolve => setTimeout(resolve, ms))
  }
-@@ -1262,8 +1270,49 @@ export function usePromptActions({
+@@ -1294,8 +1302,49 @@ export function usePromptActions({
              return
            }
  
