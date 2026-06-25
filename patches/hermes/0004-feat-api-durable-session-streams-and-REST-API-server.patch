@@ -39,7 +39,7 @@ TUI gateway (tui_gateway/server.py):
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 013bce571..c31618dce 100644
+index 027a5a530..289ead0d9 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -40,6 +40,7 @@ import os
@@ -2627,10 +2627,10 @@ index cfb63bd16..ce0cff7a0 100644
                  conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                  removed_ids.append(sid)
 diff --git a/run_agent.py b/run_agent.py
-index 630509809..84da21f8c 100644
+index 8432b0b3d..2a2b1676a 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -1666,6 +1666,7 @@ class AIAgent:
+@@ -1667,6 +1667,7 @@ class AIAgent:
                      codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                      codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                      timestamp=msg.get("timestamp"),
@@ -3860,7 +3860,7 @@ index 1d727132a..7620b43fc 100644
          """Multimodal ``content`` (list of parts) must survive the SQLite
          round-trip.  sqlite3 cannot bind Python lists directly, so the DB
 diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
-index 93b2610e2..b8dcd4b8d 100644
+index 6592a42a9..21cf549a8 100644
 --- a/tests/test_tui_gateway_server.py
 +++ b/tests/test_tui_gateway_server.py
 @@ -380,6 +380,63 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
@@ -3928,10 +3928,10 @@ index 93b2610e2..b8dcd4b8d 100644
      resp = server.dispatch([])
  
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index f97bd0110..5f6211e17 100644
+index 2bd209685..f39bbbc48 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
-@@ -3061,6 +3061,61 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
+@@ -3067,6 +3067,61 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
      return f"{text}{suffix}" if text else None
  
  
@@ -3993,7 +3993,7 @@ index f97bd0110..5f6211e17 100644
  def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
      session = _sessions.get(sid)
      if session is not None:
-@@ -3073,6 +3128,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
+@@ -3079,6 +3134,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
          except Exception:
              pass
          session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
@@ -4007,7 +4007,7 @@ index f97bd0110..5f6211e17 100644
      if _tool_progress_enabled(sid):
          payload = {
              "tool_id": tool_call_id,
-@@ -3103,6 +3165,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
+@@ -3109,6 +3171,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
          payload["result"] = json.loads(result)
      except Exception:
          payload["result"] = result
@@ -4022,7 +4022,7 @@ index f97bd0110..5f6211e17 100644
      summary = _tool_summary(name, result, duration_s)
      if summary:
          payload["summary"] = summary
-@@ -7096,7 +7166,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+@@ -7801,7 +7871,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
          session["attached_images"] = []
          if not isinstance(session.get("inflight_turn"), dict):
              _start_inflight_turn(session, text)
@@ -4036,7 +4036,7 @@ index f97bd0110..5f6211e17 100644
      _emit("message.start", sid)
  
      def run():
-@@ -7456,7 +7532,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+@@ -8161,7 +8237,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
              with session["history_lock"]:
                  session["running"] = False
                  session["last_active"] = time.time()
@@ -4050,7 +4050,7 @@ index f97bd0110..5f6211e17 100644
 +                pass
              _emit("session.info", sid, _session_info(agent, session))
  
-         # Chain a goal-continuation turn if the judge said so. We do
+         # A user prompt that arrived mid-turn (interrupt + queue) wins over
 -- 
 2.50.1 (Apple Git-155)
 

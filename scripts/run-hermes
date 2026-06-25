@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+LAUNCH_CWD="$(pwd -P)"
 if [[ ! -d "$PATCHED_WORKTREE/.git" && ! -f "$PATCHED_WORKTREE/.git" ]]; then
   "$REPO_ROOT/scripts/apply-patches"
 fi
@@ -10,6 +11,14 @@ if command -v uv >/dev/null 2>&1; then
 fi
 read -r -a RUN_PARTS <<< "$RUN_CMD"
 [[ ${#RUN_PARTS[@]} -gt 0 ]] || { echo "error: run_cmd is empty" >&2; exit 1; }
+if [[ "${RUN_PARTS[0]}" == "uv" && "${RUN_PARTS[1]:-}" == "run" ]]; then
+  cd "$LAUNCH_CWD"
+  if [[ $# -gt 0 ]]; then
+    exec uv run --project "$PATCHED_WORKTREE" "${RUN_PARTS[@]:2}" "$@"
+  else
+    exec uv run --project "$PATCHED_WORKTREE" "${RUN_PARTS[@]:2}"
+  fi
+fi
 if [[ $# -gt 0 ]]; then
   exec "${RUN_PARTS[@]}" "$@"
 else

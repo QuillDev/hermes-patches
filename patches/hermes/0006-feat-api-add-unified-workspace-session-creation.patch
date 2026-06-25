@@ -6,7 +6,7 @@ Subject: [PATCH 06/15] feat(api): add unified workspace session creation
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index c31618dce..5f45c2c08 100644
+index 289ead0d9..bb4ccd868 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -32,6 +32,7 @@ Requires:

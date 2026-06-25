@@ -206,7 +206,7 @@ index 000000000..b526e9344
 +scripts/run_tests.sh tests/gateway/test_session_api.py
 +```
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 5f45c2c08..9bf1d5582 100644
+index bb4ccd868..5719b1a8e 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -1666,6 +1666,7 @@ class APIServerAdapter(BasePlatformAdapter):

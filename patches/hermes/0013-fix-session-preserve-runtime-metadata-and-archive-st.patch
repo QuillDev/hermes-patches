@@ -76,7 +76,7 @@ index 000000000..4dbbab5cd
 +  })
 +})
 diff --git a/apps/desktop/src/app/agents/index.tsx b/apps/desktop/src/app/agents/index.tsx
-index 6a1fbf9ee..84ff2c363 100644
+index 20958c009..9bcb1ae70 100644
 --- a/apps/desktop/src/app/agents/index.tsx
 +++ b/apps/desktop/src/app/agents/index.tsx
 @@ -20,16 +20,21 @@ import {
@@ -366,7 +366,7 @@ index bc7866e60..786341797 100644
      // Repro of "loses pins until you refresh": a pinned chat falls off the
      // most-recent page, so the server stops returning it. A hard replace would
 diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
-index 958801df1..373310004 100644
+index ba2756fed..1ff7953c0 100644
 --- a/apps/desktop/src/store/session.ts
 +++ b/apps/desktop/src/store/session.ts
 @@ -116,6 +116,48 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
@@ -433,7 +433,7 @@ index 958801df1..373310004 100644
  
    if (keep.size === 0) {
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 6736ab0f2..acf17464b 100644
+index 8e256b0d3..ad7f0142a 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -1435,7 +1435,7 @@ class APIServerAdapter(BasePlatformAdapter):

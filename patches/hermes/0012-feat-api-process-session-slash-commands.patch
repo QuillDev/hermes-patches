@@ -8,7 +8,7 @@ Add opt-in command handling for API session chat routes so /model can update the
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 800fb62f2..6736ab0f2 100644
+index 1dd9b1aa8..8e256b0d3 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -481,6 +481,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option

@@ -8,7 +8,7 @@ Expose soft session archive state through the gateway API server so clients can 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 9bf1d5582..800fb62f2 100644
+index 5719b1a8e..1dd9b1aa8 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -1668,6 +1668,7 @@ class APIServerAdapter(BasePlatformAdapter):

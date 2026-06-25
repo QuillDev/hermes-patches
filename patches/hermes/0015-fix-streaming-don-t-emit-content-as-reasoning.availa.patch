@@ -23,10 +23,10 @@ in their content without separate API fields.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index f9c4a34af..a2cb6c4fb 100644
+index ea5cb6f9e..57b986659 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -3696,7 +3696,26 @@ def run_conversation(
+@@ -3725,7 +3725,26 @@ def run_conversation(
  
              # Notify progress callback of model's thinking (used by subagent
              # delegation to relay the child's reasoning to the parent display).
