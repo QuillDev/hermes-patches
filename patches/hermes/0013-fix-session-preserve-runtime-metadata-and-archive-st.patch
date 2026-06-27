@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 23:52:21 -0700
-Subject: [PATCH 13/16] fix(session): preserve runtime metadata and archive
+Subject: [PATCH 13/17] fix(session): preserve runtime metadata and archive
  state
 
 Persist safe runtime model/provider metadata on API-created sessions so future turns restore the actual Hermes runtime instead of the advertised API model id.
@@ -787,5 +787,5 @@ index de85fb8c5..a4157c4ec 100644
  
  @pytest.mark.asyncio
 -- 
-2.50.1 (Apple Git-155)
+2.52.0
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 27 Jun 2026 13:05:51 -0700
-Subject: [PATCH 16/16] fix(api): preserve session cwd binding after upstream
+Subject: [PATCH 16/17] fix(api): preserve session cwd binding after upstream
  sync
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
@@ -70,5 +70,5 @@ index b54a33e3e..852de22c6 100644
              SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
              """,
 -- 
-2.50.1 (Apple Git-155)
+2.52.0
 

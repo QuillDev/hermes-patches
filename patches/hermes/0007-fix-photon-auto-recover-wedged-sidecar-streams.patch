@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 14:54:34 -0700
-Subject: [PATCH 07/16] fix(photon): auto-recover wedged sidecar streams
+Subject: [PATCH 07/17] fix(photon): auto-recover wedged sidecar streams
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
@@ -193,5 +193,5 @@ index 31b005c24..3195e61b0 100644
 +    assert len(reasons) == 1
 +    assert "CatchUpEvents" in reasons[0]
 -- 
-2.50.1 (Apple Git-155)
+2.52.0
 
