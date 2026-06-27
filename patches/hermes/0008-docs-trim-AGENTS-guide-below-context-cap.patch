@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 18:28:58 -0700
-Subject: [PATCH 08/15] docs: trim AGENTS guide below context cap
+Subject: [PATCH 08/16] docs: trim AGENTS guide below context cap
 
 
 diff --git a/AGENTS.md b/AGENTS.md

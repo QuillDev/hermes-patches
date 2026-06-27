@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 22:44:58 -0700
-Subject: [PATCH 12/15] feat(api): process session slash commands
+Subject: [PATCH 12/16] feat(api): process session slash commands
 
 Add opt-in command handling for API session chat routes so /model can update the session model without running an agent turn. Persist non-secret model runtime metadata for future turns and cover JSON and SSE paths.
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 1dd9b1aa8..8e256b0d3 100644
+index a1eca13c0..c44c86355 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -481,6 +481,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
@@ -276,7 +276,7 @@ index 1dd9b1aa8..8e256b0d3 100644
  
          loop = asyncio.get_running_loop()
          queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
-@@ -5346,6 +5583,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5390,6 +5627,8 @@ class APIServerAdapter(BasePlatformAdapter):
          another thread to stop in-progress LLM calls.
          """
          loop = asyncio.get_running_loop()

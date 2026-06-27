@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:41 -0700
-Subject: [PATCH 02/15] feat(agent): normalize tool call aliases for shorthand
+Subject: [PATCH 02/16] feat(agent): normalize tool call aliases for shorthand
  names
 
 Map shorthand tool names (e.g. "write" -> "write_file", "shell" ->
@@ -12,10 +12,10 @@ tool_call objects and raw dict tool calls.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index a7f653932..ea5cb6f9e 100644
+index 8503a7f90..f30c1ed3a 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -3854,6 +3854,12 @@ def run_conversation(
+@@ -3974,6 +3974,12 @@ def run_conversation(
                          if repaired:
                              print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                              tc.function.name = repaired

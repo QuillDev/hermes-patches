@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sun, 21 Jun 2026 01:25:00 -0700
-Subject: [PATCH 15/15] fix(streaming): don't emit content as
+Subject: [PATCH 15/16] fix(streaming): don't emit content as
  reasoning.available when structured reasoning exists
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -23,10 +23,10 @@ in their content without separate API fields.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index ea5cb6f9e..57b986659 100644
+index f30c1ed3a..859bf4607 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -3725,7 +3725,26 @@ def run_conversation(
+@@ -3845,7 +3845,26 @@ def run_conversation(
  
              # Notify progress callback of model's thinking (used by subagent
              # delegation to relay the child's reasoning to the parent display).

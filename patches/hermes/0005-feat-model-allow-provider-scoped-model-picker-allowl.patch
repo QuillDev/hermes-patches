@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 12:05:56 -0700
-Subject: [PATCH 05/15] feat(model): allow provider-scoped model picker
+Subject: [PATCH 05/16] feat(model): allow provider-scoped model picker
  allowlist
 
 Add model_picker.allow so users can restrict picker visibility to exact provider/model pairs. The filter is provider-scoped, so gpt-5.5 can be shown only for openai-codex without also surfacing OpenAI API, Nous, or OpenRouter variants.
@@ -11,7 +11,7 @@ The policy is picker-only: explicit /model switches remain available for power u
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
-index eefc7479f..215e16450 100644
+index 0914cfc03..d30fde94f 100644
 --- a/hermes_cli/inventory.py
 +++ b/hermes_cli/inventory.py
 @@ -76,6 +76,17 @@ class ConfigContext:
@@ -157,10 +157,16 @@ index eefc7479f..215e16450 100644
  # ─── Public: payload builder ────────────────────────────────────────────
  
  
-@@ -210,6 +339,17 @@ def build_models_payload(
+@@ -213,7 +342,22 @@ def build_models_payload(
+                     row["total_models"] = len(filtered)
  
      if include_unconfigured:
-         rows = list(rows) + _append_unconfigured_rows(rows, ctx)
+-        rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
++        rows = list(rows) + [
++            r
++            for r in _append_unconfigured_rows(rows, ctx)
++            if str(r.get("slug", "")).lower() != "moa"
++        ]
 +
 +    filter_meta = None
 +    picker_filter = load_model_picker_filter()
@@ -175,7 +181,7 @@ index eefc7479f..215e16450 100644
      if picker_hints:
          _apply_picker_hints(rows)
      if canonical_order:
-@@ -219,11 +359,14 @@ def build_models_payload(
+@@ -223,11 +367,14 @@ def build_models_payload(
      if capabilities:
          _apply_capabilities(rows)
  
@@ -192,11 +198,11 @@ index eefc7479f..215e16450 100644
  
  def _apply_capabilities(rows: list[dict]) -> None:
 diff --git a/tests/hermes_cli/test_inventory.py b/tests/hermes_cli/test_inventory.py
-index af65f90a3..a8d384ca8 100644
+index d33c7ff65..601ab71a8 100644
 --- a/tests/hermes_cli/test_inventory.py
 +++ b/tests/hermes_cli/test_inventory.py
-@@ -168,6 +168,70 @@ def test_build_models_payload_returns_expected_shape():
-     assert payload["providers"] == rows
+@@ -170,6 +170,70 @@ def test_build_models_payload_returns_expected_shape():
+     assert payload["providers"][1:] == rows
  
  
 +def test_model_picker_allowlist_filters_provider_scoped_model_pairs():

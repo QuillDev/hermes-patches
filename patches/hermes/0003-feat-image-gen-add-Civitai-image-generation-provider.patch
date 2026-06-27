@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:47 -0700
-Subject: [PATCH 03/15] feat(image-gen): add Civitai image generation provider
+Subject: [PATCH 03/16] feat(image-gen): add Civitai image generation provider
 
 Add a Civitai Orchestration API image generation backend for SDXL/Illustrious AIR checkpoints and LoRAs.
 
@@ -714,10 +714,10 @@ index 000000000..46c669f0f
 +
 +    assert workflow["customOption"] is True
 diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
-index 81c6491f9..cf4512fd0 100644
+index 7806db57e..cc2cb667e 100644
 --- a/tools/image_generation_tool.py
 +++ b/tools/image_generation_tool.py
-@@ -1351,6 +1351,7 @@ def _dispatch_to_plugin_provider(
+@@ -1346,6 +1346,7 @@ def _dispatch_to_plugin_provider(
              norm_refs = normalize_reference_images(reference_image_urls)
          if norm_refs:
              kwargs["reference_image_urls"] = norm_refs

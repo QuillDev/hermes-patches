@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:21:00 -0700
-Subject: [PATCH 04/15] feat(api): durable session streams and REST API server
+Subject: [PATCH 04/16] feat(api): durable session streams and REST API server
  enhancements
 
 Add durable session event streaming, session run lifecycle tracking,
@@ -39,7 +39,7 @@ TUI gateway (tui_gateway/server.py):
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 027a5a530..289ead0d9 100644
+index 0025277d4..417985a40 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -40,6 +40,7 @@ import os
@@ -1139,7 +1139,7 @@ index 027a5a530..289ead0d9 100644
  
          return web.json_response(response_data, headers=response_headers)
  
-@@ -2409,6 +3193,14 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2453,6 +3237,14 @@ class APIServerAdapter(BasePlatformAdapter):
              })
              if conversation:
                  self._response_store.set_conversation(conversation, response_id)
@@ -1154,7 +1154,7 @@ index 027a5a530..289ead0d9 100644
  
          def _persist_incomplete_if_needed() -> None:
              """Persist an ``incomplete`` snapshot if no terminal one was written.
-@@ -2773,11 +3565,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2817,11 +3609,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  failed_env = _envelope("failed")
                  failed_env["output"] = final_items
                  failed_env["error"] = {"message": agent_error, "type": "server_error"}
@@ -1167,7 +1167,7 @@ index 027a5a530..289ead0d9 100644
                  _failed_history = list(conversation_history)
                  _failed_history.append({"role": "user", "content": user_message})
                  if final_response_text or agent_error:
-@@ -2797,11 +3585,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2841,11 +3629,7 @@ class APIServerAdapter(BasePlatformAdapter):
              else:
                  completed_env = _envelope("completed")
                  completed_env["output"] = final_items
@@ -1180,7 +1180,7 @@ index 027a5a530..289ead0d9 100644
                  full_history = self._build_response_conversation_history(
                      conversation_history,
                      user_message,
-@@ -2904,13 +3688,36 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2948,13 +3732,36 @@ class APIServerAdapter(BasePlatformAdapter):
              )
  
          raw_input = body.get("input")
@@ -1218,7 +1218,7 @@ index 027a5a530..289ead0d9 100644
  
          # conversation and previous_response_id are mutually exclusive
          if conversation and previous_response_id:
-@@ -2976,6 +3783,68 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3020,6 +3827,68 @@ class APIServerAdapter(BasePlatformAdapter):
              if instructions is None:
                  instructions = stored.get("instructions")
  
@@ -1287,7 +1287,7 @@ index 027a5a530..289ead0d9 100644
          # Append new input messages to history (all but the last become history)
          for msg in input_messages[:-1]:
              conversation_history.append(msg)
-@@ -2991,7 +3860,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3035,7 +3904,7 @@ class APIServerAdapter(BasePlatformAdapter):
  
          # Reuse session from previous_response_id chain so the dashboard
          # groups the entire conversation under one session entry.
@@ -1296,7 +1296,7 @@ index 027a5a530..289ead0d9 100644
  
          stream = _coerce_request_bool(body.get("stream"), default=False)
          if stream:
-@@ -3046,31 +3915,39 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3090,31 +3959,39 @@ class APIServerAdapter(BasePlatformAdapter):
                  tool_complete_callback=_on_tool_complete,
                  agent_ref=agent_ref,
                  gateway_session_key=gateway_session_key,
@@ -1353,7 +1353,7 @@ index 027a5a530..289ead0d9 100644
  
          async def _compute_response():
              return await self._run_agent(
-@@ -3079,13 +3956,14 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3123,13 +4000,14 @@ class APIServerAdapter(BasePlatformAdapter):
                  ephemeral_system_prompt=instructions,
                  session_id=session_id,
                  gateway_session_key=gateway_session_key,
@@ -1369,7 +1369,7 @@ index 027a5a530..289ead0d9 100644
              )
              try:
                  result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
-@@ -3136,14 +4014,15 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3180,14 +4058,15 @@ class APIServerAdapter(BasePlatformAdapter):
              "object": "response",
              "status": "completed",
              "created_at": created_at,
@@ -1391,7 +1391,7 @@ index 027a5a530..289ead0d9 100644
  
          # Store the complete response object for future chaining / GET retrieval
          if store:
-@@ -3157,6 +4036,12 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3201,6 +4080,12 @@ class APIServerAdapter(BasePlatformAdapter):
              # conversation name automatically chains to this response
              if conversation:
                  self._response_store.set_conversation(conversation, response_id)
@@ -1404,7 +1404,7 @@ index 027a5a530..289ead0d9 100644
  
          response_headers = {"X-Hermes-Session-Id": session_id}
          if gateway_session_key:
-@@ -3164,9 +4049,245 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3208,9 +4093,245 @@ class APIServerAdapter(BasePlatformAdapter):
          return web.json_response(response_data, headers=response_headers)
  
      # ------------------------------------------------------------------
@@ -1651,7 +1651,7 @@ index 027a5a530..289ead0d9 100644
      async def _handle_get_response(self, request: "web.Request") -> "web.Response":
          """GET /v1/responses/{response_id} — retrieve a stored response."""
          auth_err = self._check_auth(request)
-@@ -3640,6 +4761,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3684,6 +4805,7 @@ class APIServerAdapter(BasePlatformAdapter):
      # Agent execution
      # ------------------------------------------------------------------
  
@@ -1659,7 +1659,7 @@ index 027a5a530..289ead0d9 100644
      def _concurrency_limited_response(self) -> Optional["web.Response"]:
          """Return a 429 response if the concurrent-run cap is reached, else None.
  
-@@ -3697,6 +4819,58 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3741,6 +4863,58 @@ class APIServerAdapter(BasePlatformAdapter):
              async_delivery=False,
          )
  
@@ -1718,7 +1718,7 @@ index 027a5a530..289ead0d9 100644
      async def _run_agent(
          self,
          user_message: str,
-@@ -3709,6 +4883,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3753,6 +4927,7 @@ class APIServerAdapter(BasePlatformAdapter):
          tool_complete_callback=None,
          agent_ref: Optional[list] = None,
          gateway_session_key: Optional[str] = None,
@@ -1726,7 +1726,7 @@ index 027a5a530..289ead0d9 100644
      ) -> tuple:
          """
          Create an agent and run a conversation in a thread executor.
-@@ -3740,6 +4915,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3784,6 +4959,7 @@ class APIServerAdapter(BasePlatformAdapter):
                      tool_start_callback=tool_start_callback,
                      tool_complete_callback=tool_complete_callback,
                      gateway_session_key=gateway_session_key,
@@ -1734,7 +1734,7 @@ index 027a5a530..289ead0d9 100644
                  )
                  if agent_ref is not None:
                      agent_ref[0] = agent
-@@ -3749,11 +4925,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3793,11 +4969,7 @@ class APIServerAdapter(BasePlatformAdapter):
                      conversation_history=conversation_history,
                      task_id=effective_task_id,
                  )
@@ -1747,7 +1747,7 @@ index 027a5a530..289ead0d9 100644
                  # Include the effective session ID in the result so callers
                  # (e.g. X-Hermes-Session-Id header) can track compression-
                  # triggered session rotations. (#16938)
-@@ -3770,6 +4942,76 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3814,6 +4986,76 @@ class APIServerAdapter(BasePlatformAdapter):
          finally:
              self._inflight_agent_runs -= 1
  
@@ -1824,7 +1824,7 @@ index 027a5a530..289ead0d9 100644
      # ------------------------------------------------------------------
      # /v1/runs — structured event streaming
      # ------------------------------------------------------------------
-@@ -3868,6 +5110,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3912,6 +5154,8 @@ class APIServerAdapter(BasePlatformAdapter):
          if not user_message:
              return web.json_response(_openai_error("No user message found in input"), status=400)
  
@@ -1833,7 +1833,7 @@ index 027a5a530..289ead0d9 100644
          instructions = body.get("instructions")
          previous_response_id = body.get("previous_response_id")
  
-@@ -3917,6 +5161,13 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3961,6 +5205,13 @@ class APIServerAdapter(BasePlatformAdapter):
  
          run_id = f"run_{uuid.uuid4().hex}"
          session_id = body.get("session_id") or stored_session_id or run_id
@@ -1847,7 +1847,7 @@ index 027a5a530..289ead0d9 100644
          approval_session_key = gateway_session_key or session_id or run_id
          ephemeral_system_prompt = instructions
          loop = asyncio.get_running_loop()
-@@ -3947,20 +5198,32 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -3991,20 +5242,32 @@ class APIServerAdapter(BasePlatformAdapter):
              "queued",
              created_at=created_at,
              session_id=session_id,
@@ -1887,7 +1887,7 @@ index 027a5a530..289ead0d9 100644
  
                  def _approval_notify(approval_data: Dict[str, Any]) -> None:
                      event = dict(approval_data or {})
-@@ -3998,6 +5261,39 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4042,6 +5305,39 @@ class APIServerAdapter(BasePlatformAdapter):
                      )
  
                      effective_task_id = session_id or run_id
@@ -1927,7 +1927,7 @@ index 027a5a530..289ead0d9 100644
                      approval_token = None
                      session_tokens = []
                      try:
-@@ -4028,11 +5324,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4072,11 +5368,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                      clear_session_vars(session_tokens)
                                  except Exception:
                                      pass
@@ -1940,7 +1940,7 @@ index 027a5a530..289ead0d9 100644
                      return r, u
  
                  result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-@@ -4053,6 +5345,16 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4097,6 +5389,16 @@ class APIServerAdapter(BasePlatformAdapter):
                          error=error_msg,
                          last_event="run.failed",
                      )
@@ -1957,7 +1957,7 @@ index 027a5a530..289ead0d9 100644
                  else:
                      final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                      q.put_nowait({
-@@ -4069,6 +5371,17 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4113,6 +5415,17 @@ class APIServerAdapter(BasePlatformAdapter):
                          usage=usage,
                          last_event="run.completed",
                      )
@@ -1975,7 +1975,7 @@ index 027a5a530..289ead0d9 100644
              except asyncio.CancelledError:
                  self._set_run_status(
                      run_id,
-@@ -4083,6 +5396,15 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4127,6 +5440,15 @@ class APIServerAdapter(BasePlatformAdapter):
                      })
                  except Exception:
                      pass
@@ -1991,7 +1991,7 @@ index 027a5a530..289ead0d9 100644
                  raise
              except Exception as exc:
                  logger.exception("[api_server] run %s failed", run_id)
-@@ -4101,6 +5423,16 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4145,6 +5467,16 @@ class APIServerAdapter(BasePlatformAdapter):
                      })
                  except Exception:
                      pass
@@ -2008,7 +2008,7 @@ index 027a5a530..289ead0d9 100644
              finally:
                  # If the asyncio wrapper is cancelled (for example via
                  # /stop), the executor thread can still be blocked waiting
-@@ -4390,17 +5722,30 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4434,17 +5766,30 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_get("/v1/skills", self._handle_skills)
              self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
              # Session/client control surface (thin wrappers over SessionDB + _run_agent)
@@ -2040,10 +2040,10 @@ index 027a5a530..289ead0d9 100644
              self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
              # Cron jobs management API
 diff --git a/hermes_state.py b/hermes_state.py
-index cfb63bd16..ce0cff7a0 100644
+index a7938f716..563641c4f 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -102,6 +102,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
+@@ -106,6 +106,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
      ids = _collect_delegate_child_ids(conn, parent_ids)
      if ids:
          ph = ",".join("?" * len(ids))
@@ -2051,7 +2051,7 @@ index cfb63bd16..ce0cff7a0 100644
          conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
          # FK safety: orphan any untagged stragglers pointing at a doomed row.
          conn.execute(
-@@ -591,12 +592,36 @@ CREATE TABLE IF NOT EXISTS compression_locks (
+@@ -671,12 +672,36 @@ CREATE TABLE IF NOT EXISTS compression_locks (
      expires_at REAL NOT NULL
  );
  
@@ -2088,7 +2088,7 @@ index cfb63bd16..ce0cff7a0 100644
  """
  
  # Indexes that reference columns added in later schema versions must be
-@@ -1023,6 +1048,342 @@ class SessionDB:
+@@ -1103,6 +1128,342 @@ class SessionDB:
                  self._conn.close()
                  self._conn = None
  
@@ -2431,7 +2431,7 @@ index cfb63bd16..ce0cff7a0 100644
      @staticmethod
      def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
          """Extract expected columns per table from SCHEMA_SQL.
-@@ -1391,11 +1752,25 @@ class SessionDB:
+@@ -1471,11 +1832,25 @@ class SessionDB:
          intentionally need to re-end a closed session with a new reason.
          """
          def _do(conn):
@@ -2459,7 +2459,7 @@ index cfb63bd16..ce0cff7a0 100644
          self._execute_write(_do)
  
      def reopen_session(self, session_id: str) -> None:
-@@ -1405,6 +1780,12 @@ class SessionDB:
+@@ -1485,6 +1860,12 @@ class SessionDB:
                  "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                  (session_id,),
              )
@@ -2471,8 +2471,8 @@ index cfb63bd16..ce0cff7a0 100644
 +            )
          self._execute_write(_do)
  
-     def update_session_cwd(self, session_id: str, cwd: str) -> None:
-@@ -2503,6 +2884,7 @@ class SessionDB:
+     def update_session_cwd(
+@@ -2722,6 +3103,7 @@ class SessionDB:
          codex_reasoning_items: Any = None,
          codex_message_items: Any = None,
          platform_message_id: str = None,
@@ -2480,7 +2480,7 @@ index cfb63bd16..ce0cff7a0 100644
          observed: bool = False,
          timestamp: Any = None,
      ) -> int:
-@@ -2552,6 +2934,7 @@ class SessionDB:
+@@ -2771,6 +3153,7 @@ class SessionDB:
              num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
  
          def _do(conn):
@@ -2488,7 +2488,7 @@ index cfb63bd16..ce0cff7a0 100644
              cursor = conn.execute(
                  """INSERT INTO messages (session_id, role, content, tool_call_id,
                     tool_calls, tool_name, timestamp, token_count, finish_reason,
-@@ -2591,6 +2974,34 @@ class SessionDB:
+@@ -2810,6 +3193,34 @@ class SessionDB:
                      "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                      (session_id,),
                  )
@@ -2523,7 +2523,7 @@ index cfb63bd16..ce0cff7a0 100644
              return msg_id
  
          return self._execute_write(_do)
-@@ -2643,7 +3054,7 @@ class SessionDB:
+@@ -2862,7 +3273,7 @@ class SessionDB:
                  msg.get("platform_message_id") or msg.get("message_id")
              )
  
@@ -2532,7 +2532,7 @@ index cfb63bd16..ce0cff7a0 100644
                  """INSERT INTO messages (session_id, role, content, tool_call_id,
                     tool_calls, tool_name, timestamp, token_count, finish_reason,
                     reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-@@ -2668,7 +3079,30 @@ class SessionDB:
+@@ -2887,7 +3298,30 @@ class SessionDB:
                      1 if msg.get("observed") else 0,
                  ),
              )
@@ -2563,7 +2563,7 @@ index cfb63bd16..ce0cff7a0 100644
              if tool_calls is not None:
                  tool_calls_total += (
                      len(tool_calls) if isinstance(tool_calls, list) else 1
-@@ -2689,6 +3123,9 @@ class SessionDB:
+@@ -2908,6 +3342,9 @@ class SessionDB:
          """
  
          def _do(conn):
@@ -2573,7 +2573,7 @@ index cfb63bd16..ce0cff7a0 100644
              conn.execute(
                  "DELETE FROM messages WHERE session_id = ?", (session_id,)
              )
-@@ -2696,6 +3133,14 @@ class SessionDB:
+@@ -2915,6 +3352,14 @@ class SessionDB:
                  "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                  (session_id,),
              )
@@ -2588,7 +2588,7 @@ index cfb63bd16..ce0cff7a0 100644
              total_messages, total_tool_calls = self._insert_message_rows(
                  conn, session_id, messages
              )
-@@ -4028,6 +4473,7 @@ class SessionDB:
+@@ -4276,6 +4721,7 @@ class SessionDB:
                  "WHERE parent_session_id = ?",
                  (session_id,),
              )
@@ -2596,7 +2596,7 @@ index cfb63bd16..ce0cff7a0 100644
              conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
              conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
              return True
-@@ -4146,6 +4592,10 @@ class SessionDB:
+@@ -4394,6 +4840,10 @@ class SessionDB:
                  f"WHERE parent_session_id IN ({existing_placeholders})",
                  existing,
              )
@@ -2607,7 +2607,7 @@ index cfb63bd16..ce0cff7a0 100644
              conn.execute(
                  f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
                  existing,
-@@ -4238,6 +4688,10 @@ class SessionDB:
+@@ -4486,6 +4936,10 @@ class SessionDB:
                  f"WHERE parent_session_id IN ({placeholders})",
                  list(session_ids),
              )
@@ -2618,7 +2618,7 @@ index cfb63bd16..ce0cff7a0 100644
  
              for sid in session_ids:
                  # DELETE FROM messages is paranoia — by construction
-@@ -4300,6 +4754,7 @@ class SessionDB:
+@@ -4548,6 +5002,7 @@ class SessionDB:
              )
  
              for sid in session_ids:
@@ -2627,10 +2627,10 @@ index cfb63bd16..ce0cff7a0 100644
                  conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                  removed_ids.append(sid)
 diff --git a/run_agent.py b/run_agent.py
-index 8432b0b3d..2a2b1676a 100644
+index 3a3b6f4f0..6b698c5a0 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -1667,6 +1667,7 @@ class AIAgent:
+@@ -1692,6 +1692,7 @@ class AIAgent:
                      codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                      codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                      timestamp=msg.get("timestamp"),
@@ -3792,10 +3792,10 @@ index 47f7b38ee..c1a78c4c1 100644
  async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
      """run.completed must include the full interleaved turn transcript so a
 diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
-index 1d727132a..7620b43fc 100644
+index b9af9f25a..c099eade2 100644
 --- a/tests/test_hermes_state.py
 +++ b/tests/test_hermes_state.py
-@@ -612,6 +612,63 @@ class TestMessageStorage:
+@@ -720,6 +720,63 @@ class TestMessageStorage:
          messages = db.get_messages("s1")
          assert messages[0]["tool_calls"] == tool_calls
  
@@ -3860,7 +3860,7 @@ index 1d727132a..7620b43fc 100644
          """Multimodal ``content`` (list of parts) must survive the SQLite
          round-trip.  sqlite3 cannot bind Python lists directly, so the DB
 diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
-index 6592a42a9..21cf549a8 100644
+index 97f584d07..c5cf533c1 100644
 --- a/tests/test_tui_gateway_server.py
 +++ b/tests/test_tui_gateway_server.py
 @@ -380,6 +380,63 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
@@ -3928,10 +3928,10 @@ index 6592a42a9..21cf549a8 100644
      resp = server.dispatch([])
  
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 2bd209685..f39bbbc48 100644
+index ec61aed6d..31dd5bb6e 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
-@@ -3067,6 +3067,61 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
+@@ -3279,6 +3279,61 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
      return f"{text}{suffix}" if text else None
  
  
@@ -3993,7 +3993,7 @@ index 2bd209685..f39bbbc48 100644
  def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
      session = _sessions.get(sid)
      if session is not None:
-@@ -3079,6 +3134,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
+@@ -3291,6 +3346,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
          except Exception:
              pass
          session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
@@ -4007,7 +4007,7 @@ index 2bd209685..f39bbbc48 100644
      if _tool_progress_enabled(sid):
          payload = {
              "tool_id": tool_call_id,
-@@ -3109,6 +3171,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
+@@ -3321,6 +3383,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
          payload["result"] = json.loads(result)
      except Exception:
          payload["result"] = result
@@ -4022,13 +4022,18 @@ index 2bd209685..f39bbbc48 100644
      summary = _tool_summary(name, result, duration_s)
      if summary:
          payload["summary"] = summary
-@@ -7801,7 +7871,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+@@ -8280,12 +8350,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
          session["attached_images"] = []
          if not isinstance(session.get("inflight_turn"), dict):
              _start_inflight_turn(session, text)
 +        response_id = f"tui-turn:{uuid.uuid4().hex}"
 +        session["active_response_id"] = response_id
      agent = session["agent"]
+     if hasattr(agent, "clear_interrupt"):
+         try:
+             agent.clear_interrupt()
+         except Exception:
+             pass
 +    try:
 +        setattr(agent, "_current_response_id", response_id)
 +    except Exception:
@@ -4036,7 +4041,7 @@ index 2bd209685..f39bbbc48 100644
      _emit("message.start", sid)
  
      def run():
-@@ -8161,7 +8237,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+@@ -8690,7 +8766,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
              with session["history_lock"]:
                  session["running"] = False
                  session["last_active"] = time.time()

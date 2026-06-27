@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:41 -0700
-Subject: [PATCH 01/15] fix(agent): catch TypeError alongside JSONDecodeError
+Subject: [PATCH 01/16] fix(agent): catch TypeError alongside JSONDecodeError
  in Keychain parsing
 
 The Keychain credential payload can arrive as a non-string type under
@@ -11,7 +11,7 @@ JSONDecodeError. Catch both to avoid crashing the adapter.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 4f7595c94..812cf25e2 100644
+index 4f9222597..07c509590 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
 @@ -893,10 +893,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:

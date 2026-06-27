@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sun, 21 Jun 2026 00:58:57 -0700
-Subject: [PATCH 14/15] fix(desktop): apply typed model slash commands live
+Subject: [PATCH 14/16] fix(desktop): apply typed model slash commands live
 
 Route typed /model arguments through the desktop config RPC instead of the slash worker so the active session model is updated directly. Surface confirmation-required responses without claiming the switch applied.
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
-index 5a3c32417..067baa0f9 100644
+index bd971dd52..2e8fe0132 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
-@@ -297,6 +297,67 @@ describe('usePromptActions desktop slash pickers', () => {
+@@ -304,6 +304,67 @@ describe('usePromptActions desktop slash pickers', () => {
      expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
    })
  
@@ -80,10 +80,10 @@ index 5a3c32417..067baa0f9 100644
      vi.useFakeTimers()
      const calls: { method: string; params?: Record<string, unknown> }[] = []
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-index 307fb7e24..fbf96702c 100644
+index 6e2829d61..edad24067 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-@@ -79,6 +79,14 @@ interface HandoffResult {
+@@ -81,6 +81,14 @@ interface HandoffResult {
    error?: string
  }
  
@@ -98,7 +98,7 @@ index 307fb7e24..fbf96702c 100644
  function delay(ms: number): Promise<void> {
    return new Promise(resolve => setTimeout(resolve, ms))
  }
-@@ -1317,8 +1325,49 @@ export function usePromptActions({
+@@ -1377,8 +1385,49 @@ export function usePromptActions({
              return
            }
  

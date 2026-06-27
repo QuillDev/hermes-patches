@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 23:52:21 -0700
-Subject: [PATCH 13/15] fix(session): preserve runtime metadata and archive
+Subject: [PATCH 13/16] fix(session): preserve runtime metadata and archive
  state
 
 Persist safe runtime model/provider metadata on API-created sessions so future turns restore the actual Hermes runtime instead of the advertised API model id.
@@ -76,10 +76,10 @@ index 000000000..4dbbab5cd
 +  })
 +})
 diff --git a/apps/desktop/src/app/agents/index.tsx b/apps/desktop/src/app/agents/index.tsx
-index 20958c009..9bcb1ae70 100644
+index 8f6c2349f..72f055ce7 100644
 --- a/apps/desktop/src/app/agents/index.tsx
 +++ b/apps/desktop/src/app/agents/index.tsx
-@@ -20,16 +20,21 @@ import {
+@@ -21,16 +21,21 @@ import {
  
  import { OverlayView } from '../overlays/overlay-view'
  
@@ -108,7 +108,7 @@ index 20958c009..9bcb1ae70 100644
      )
    }
  
-@@ -37,7 +42,7 @@ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNo
+@@ -38,7 +43,7 @@ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNo
      return <AlertCircle aria-label={a.failed} className="size-3.5 shrink-0 text-destructive" />
    }
  
@@ -118,10 +118,10 @@ index 20958c009..9bcb1ae70 100644
  
  const STREAM_TONE: Record<SubagentStreamEntry['kind'], string> = {
 diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.ts b/apps/desktop/src/app/session/hooks/use-session-actions.ts
-index 36dfea759..34a543b04 100644
+index a25dc550b..77ed3d2da 100644
 --- a/apps/desktop/src/app/session/hooks/use-session-actions.ts
 +++ b/apps/desktop/src/app/session/hooks/use-session-actions.ts
-@@ -22,6 +22,8 @@ import {
+@@ -29,6 +29,8 @@ import {
    $messages,
    $sessions,
    $yoloActive,
@@ -130,15 +130,15 @@ index 36dfea759..34a543b04 100644
    sessionPinId,
    setActiveSessionId,
    setAwaitingResponse,
-@@ -970,6 +972,7 @@ export function useSessionActions({
+@@ -1070,6 +1072,7 @@ export function useSessionActions({
        // live tip after compression. Drop both so the pin can't linger.
        const removedPinId = removed ? sessionPinId(removed) : storedSessionId
  
 +      markSessionOptimisticallyHidden(storedSessionId, removed?._lineage_root_id)
        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
-       // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
-       // doesn't keep claiming the removed row is still on the server.
-@@ -994,6 +997,9 @@ export function useSessionActions({
+       // Evict from the project tree's optimistic layer too (the backend snapshot
+       // still lists it until its next refresh), so grouped + flat views drop the
+@@ -1098,6 +1101,9 @@ export function useSessionActions({
            clearQueuedPrompts(closingRuntimeId)
          }
        } catch (err) {
@@ -148,15 +148,15 @@ index 36dfea759..34a543b04 100644
          if (removed) {
            setSessions(prev => [removed, ...prev])
            setSessionsTotal(prev => prev + 1)
-@@ -1052,6 +1058,7 @@ export function useSessionActions({
+@@ -1157,6 +1163,7 @@ export function useSessionActions({
        const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
  
        // Soft-hide: drop from the sidebar immediately, keep the data.
 +      markSessionOptimisticallyHidden(storedSessionId, archived?._lineage_root_id)
        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+       tombstoneSessions([storedSessionId, archived?.id, archived?._lineage_root_id])
        // Archived sessions are hidden by the listSessions(min_messages=1) query
-       // on the next refresh, so they count as "removed" for the load-more
-@@ -1073,6 +1080,9 @@ export function useSessionActions({
+@@ -1179,6 +1186,9 @@ export function useSessionActions({
          $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
          notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
        } catch (err) {
@@ -216,10 +216,10 @@ index 000000000..f9d4497eb
 +  })
 +})
 diff --git a/apps/desktop/src/components/assistant-ui/thread.tsx b/apps/desktop/src/components/assistant-ui/thread.tsx
-index 6057307de..38f5ad2d1 100644
+index 706345f70..a12703cab 100644
 --- a/apps/desktop/src/components/assistant-ui/thread.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread.tsx
-@@ -84,7 +84,6 @@ import {
+@@ -83,7 +83,6 @@ import {
    DropdownMenuLabel,
    DropdownMenuTrigger
  } from '@/components/ui/dropdown-menu'
@@ -227,16 +227,16 @@ index 6057307de..38f5ad2d1 100644
  import type { HermesGateway } from '@/hermes'
  import { useResizeObserver } from '@/hooks/use-resize-observer'
  import { useI18n } from '@/i18n'
-@@ -212,7 +211,7 @@ export const Thread: FC<{
-         loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+@@ -250,7 +249,7 @@ export const Thread: FC<{
+         loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
          sessionKey={sessionKey}
        />
 -      {loading === 'session' && <CenteredThreadSpinner />}
 +      {loading === 'session' && <ThreadLoadingSkeleton />}
        <ThreadTimeline />
-     </div>
-   )
-@@ -228,27 +227,65 @@ function pickPrimaryPreviewTarget(targets: string[]): string[] {
+       <ConfirmDialog
+         confirmLabel={copy.restoreConfirm}
+@@ -275,27 +274,65 @@ function pickPrimaryPreviewTarget(targets: string[]): string[] {
    return [localUrl || targets[targets.length - 1]]
  }
  
@@ -313,7 +313,7 @@ index 6057307de..38f5ad2d1 100644
    onBranchInNewChat?: (messageId: string) => void
    onDismissError?: (messageId: string) => void
 diff --git a/apps/desktop/src/store/session.test.ts b/apps/desktop/src/store/session.test.ts
-index bc7866e60..786341797 100644
+index 013ad0efd..37802352f 100644
 --- a/apps/desktop/src/store/session.test.ts
 +++ b/apps/desktop/src/store/session.test.ts
 @@ -9,7 +9,9 @@ import {
@@ -326,7 +326,7 @@ index bc7866e60..786341797 100644
    mergeSessionPage,
    sessionPinId,
    setCurrentCwd,
-@@ -119,6 +121,38 @@ describe('mergeSessionPage', () => {
+@@ -121,6 +123,38 @@ describe('mergeSessionPage', () => {
      expect(mergeSessionPage(previous, incoming, ['b']).map(s => s.id)).toEqual(['b'])
    })
  
@@ -366,10 +366,10 @@ index bc7866e60..786341797 100644
      // Repro of "loses pins until you refresh": a pinned chat falls off the
      // most-recent page, so the server stops returning it. A hard replace would
 diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
-index ba2756fed..1ff7953c0 100644
+index 2be408530..6983f0eb6 100644
 --- a/apps/desktop/src/store/session.ts
 +++ b/apps/desktop/src/store/session.ts
-@@ -116,6 +116,48 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
+@@ -125,6 +125,48 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
  export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
    session._lineage_root_id ?? session.id
  
@@ -418,7 +418,7 @@ index ba2756fed..1ff7953c0 100644
  /** Merge a fresh server session page into the in-memory list, keeping any
   *  row the server omitted that we still want visible — both still-"working"
   *  sessions and pinned sessions.
-@@ -144,6 +186,13 @@ export function mergeSessionPage(
+@@ -153,6 +195,13 @@ export function mergeSessionPage(
    incoming: SessionInfo[],
    keepIds: Iterable<string>
  ): SessionInfo[] {
@@ -431,9 +431,9 @@ index ba2756fed..1ff7953c0 100644
 +
    const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
  
-   if (keep.size === 0) {
+   // Carry a known title onto a row that arrives title-less, so a freshly
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 8e256b0d3..ad7f0142a 100644
+index c44c86355..25c00c0ac 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -1435,7 +1435,7 @@ class APIServerAdapter(BasePlatformAdapter):

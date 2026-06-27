@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 20:51:55 -0700
-Subject: [PATCH 09/15] feat(api): add live session sync subscription
+Subject: [PATCH 09/16] feat(api): add live session sync subscription
 
 Add a session subscribe SSE endpoint that emits a snapshot, catch-up
 state, and replayable live run events for clients that drop into an
@@ -206,7 +206,7 @@ index 000000000..b526e9344
 +scripts/run_tests.sh tests/gateway/test_session_api.py
 +```
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index bb4ccd868..5719b1a8e 100644
+index 4d8382de4..35b61c6a6 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -1666,6 +1666,7 @@ class APIServerAdapter(BasePlatformAdapter):
@@ -384,7 +384,7 @@ index bb4ccd868..5719b1a8e 100644
      async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
          """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
          auth_err = self._check_auth(request)
-@@ -6020,6 +6149,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -6064,6 +6193,7 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
              self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
              self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)

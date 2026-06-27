@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 13:23:59 -0700
-Subject: [PATCH 06/15] feat(api): add unified workspace session creation
+Subject: [PATCH 06/16] feat(api): add unified workspace session creation
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 289ead0d9..bb4ccd868 100644
+index 417985a40..4d8382de4 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -32,6 +32,7 @@ Requires:
@@ -360,7 +360,7 @@ index 289ead0d9..bb4ccd868 100644
      def _live_session_state(self, session_id: str, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
          payload = dict(state or {
              "object": "hermes.session.state",
-@@ -4905,6 +5188,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -4949,6 +5232,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  chat_id=session_id or "",
                  session_key=gateway_session_key or session_id or "",
                  session_id=session_id or "",
@@ -368,7 +368,7 @@ index 289ead0d9..bb4ccd868 100644
              )
              try:
                  agent = self._create_agent(
-@@ -5721,6 +6005,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5765,6 +6049,8 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
              self._app.router.add_get("/v1/skills", self._handle_skills)
              self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
