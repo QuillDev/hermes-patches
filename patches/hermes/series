@@ -15,3 +15,5 @@
 0015-fix-streaming-don-t-emit-content-as-reasoning.availa.patch
 0016-fix-api-preserve-session-cwd-binding-after-upstream-.patch
 0017-refactor-api-drop-unused-session-replay-endpoints.patch
+0018-fix-skip-Ollama-context-probe-for-OpenRouter.patch
+0019-fix-speed-up-interactive-CLI-startup.patch

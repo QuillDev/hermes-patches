@@ -1,0 +1,481 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quill <quill@example.com>
+Date: Sat, 27 Jun 2026 18:53:01 -0700
+Subject: [PATCH 19/19] fix: speed up interactive CLI startup
+
+Keep omitted --compact as None so HermesCLI can honor display.compact. Add display.startup_banner and display.startup_status toggles for users who want the fastest path to the prompt.
+
+For bare interactive chat, defer plugin discovery, shell-hook registration, and default platform toolset resolution until the first real agent turn. One-shot/query modes still prepare synchronously so plugin toolsets and hooks are ready before execution.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/cli.py b/cli.py
+index 101ac997d..3a0376276 100644
+--- a/cli.py
++++ b/cli.py
+@@ -929,7 +929,7 @@ def _mark_tui_input_modes_active() -> None:
+ 
+ 
+ def _prepare_deferred_agent_startup() -> None:
+-    """Run Termux-deferred agent discovery before the first real agent turn."""
++    """Run deferred agent discovery before the first real agent turn."""
+     global _deferred_agent_startup_done
+     if _deferred_agent_startup_done:
+         return
+@@ -956,7 +956,7 @@ def _prepare_deferred_agent_startup() -> None:
+ 
+         start_background_mcp_discovery(
+             logger=logger,
+-            thread_name="termux-cli-mcp-discovery",
++            thread_name="deferred-cli-mcp-discovery",
+         )
+     except Exception:
+         logger.debug(
+@@ -3443,7 +3443,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         base_url: str = None,
+         max_turns: int = None,
+         verbose: Optional[bool] = None,
+-        compact: bool = False,
++        compact: bool | None = None,
+         resume: str = None,
+         checkpoints: bool = False,
+         pass_session_id: bool = False,
+@@ -3468,6 +3468,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         self.console = Console()
+         self.config = CLI_CONFIG
+         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
++        self.startup_banner = CLI_CONFIG["display"].get("startup_banner", True)
++        self.startup_status = CLI_CONFIG["display"].get("startup_status", True)
+         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
+         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
+         _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
+@@ -3629,6 +3631,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         
+         # Parse and validate toolsets
+         self.enabled_toolsets = toolsets
++        self._deferred_toolset_resolution = False
+         self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
+ 
+         if toolsets and "all" not in toolsets and "*" not in toolsets:
+@@ -5863,7 +5866,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+         
+         if use_compact:
+             self._console_print(_build_compact_banner())
+-            self._show_status()
++            if self.startup_status:
++                self._show_status()
+         else:
+             # Get tools for display
+             tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+@@ -5883,8 +5887,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+                 provider=self.provider,
+             )
+         
+-        # Tool discovery is intentionally deferred on the Termux bare prompt
+-        # path; availability warnings are shown once tools are initialized.
++        # Tool discovery can be deferred on bare interactive prompts;
++        # availability warnings are shown once tools are initialized.
+         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+             self._show_tool_availability_warnings()
+ 
+@@ -6183,7 +6187,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+     
+     def _show_status(self):
+         """Show compact startup status line."""
+-        # Avoid pulling the full tool registry into the bare Termux prompt path.
++        # Avoid pulling the full tool registry into the bare interactive prompt path.
+         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
+             tool_status = "tools deferred"
+         else:
+@@ -12555,18 +12559,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+             _detect_light_mode()
+         except Exception:
+             pass
+-        # Push the entire TUI to the bottom of the terminal so the banner,
+-        # responses, and prompt all appear pinned to the bottom — empty
+-        # space stays above, not below.  This prints enough blank lines to
+-        # scroll the cursor to the last row before any content is rendered.
+-        try:
+-            _term_lines = shutil.get_terminal_size().lines
+-            if _term_lines > 2:
+-                print("\n" * (_term_lines - 1), end="", flush=True)
+-        except Exception:
+-            pass
++        if self.startup_banner:
++            # Push the entire TUI to the bottom of the terminal so the banner,
++            # responses, and prompt all appear pinned to the bottom — empty
++            # space stays above, not below.  This prints enough blank lines to
++            # scroll the cursor to the last row before any content is rendered.
++            try:
++                _term_lines = shutil.get_terminal_size().lines
++                if _term_lines > 2:
++                    print("\n" * (_term_lines - 1), end="", flush=True)
++            except Exception:
++                pass
+ 
+-        self.show_banner()
++            self.show_banner()
+         # Surface any active supply-chain security advisories right after the
+         # welcome banner. Quiet/single-query paths call this themselves.
+         self._show_security_advisories()
+@@ -12576,15 +12581,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+             if self._preload_resumed_session():
+                 self._display_resumed_history()
+ 
+-        try:
+-            from hermes_cli.skin_engine import get_active_skin
+-            _welcome_skin = get_active_skin()
+-            _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
+-            _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
+-        except Exception:
+-            _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
+-            _welcome_color = "#FFF8DC"
+-        self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
++        _welcome_skin = None
++        if self.startup_banner:
++            try:
++                from hermes_cli.skin_engine import get_active_skin
++                _welcome_skin = get_active_skin()
++                _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
++                _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
++            except Exception:
++                _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
++                _welcome_color = "#FFF8DC"
++            self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+ 
+         # Warm the /model picker's provider-models cache off-thread during this
+         # idle window (banner shown, user about to type). The no-args picker
+@@ -12613,41 +12620,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+                 )
+         except Exception:
+             pass
+-        # First-time OpenClaw-residue banner — fires once if ~/.openclaw/ exists
+-        # after an OpenClaw→Hermes migration (especially migrations done by
+-        # OpenClaw's own tool, which doesn't archive the source directory).
+-        try:
+-            from agent.onboarding import (
+-                OPENCLAW_RESIDUE_FLAG,
+-                detect_openclaw_residue,
+-                is_seen,
+-                mark_seen,
+-                openclaw_residue_hint_cli,
+-            )
+-            if not is_seen(self.config, OPENCLAW_RESIDUE_FLAG) and detect_openclaw_residue():
+-                try:
+-                    _resid_color = _welcome_skin.get_color("banner_dim", "#B8860B")
+-                except Exception:
+-                    _resid_color = "#B8860B"
+-                self._console_print(f"[{_resid_color}]{openclaw_residue_hint_cli()}[/]")
++        if self.startup_banner:
++            # First-time OpenClaw-residue banner — fires once if ~/.openclaw/ exists
++            # after an OpenClaw→Hermes migration (especially migrations done by
++            # OpenClaw's own tool, which doesn't archive the source directory).
++            try:
++                from agent.onboarding import (
++                    OPENCLAW_RESIDUE_FLAG,
++                    detect_openclaw_residue,
++                    is_seen,
++                    mark_seen,
++                    openclaw_residue_hint_cli,
++                )
++                if not is_seen(self.config, OPENCLAW_RESIDUE_FLAG) and detect_openclaw_residue():
++                    try:
++                        _resid_color = _welcome_skin.get_color("banner_dim", "#B8860B") if _welcome_skin else "#B8860B"
++                    except Exception:
++                        _resid_color = "#B8860B"
++                    self._console_print(f"[{_resid_color}]{openclaw_residue_hint_cli()}[/]")
++                    try:
++                        from hermes_cli.config import get_config_path as _get_cfg_path_resid
++                        mark_seen(_get_cfg_path_resid(), OPENCLAW_RESIDUE_FLAG)
++                    except Exception:
++                        pass  # best-effort — banner will fire again next session
++            except Exception:
++                pass  # banner is non-critical — never break startup
++        if self.startup_banner:
++            # Show a random tip to help users discover features
++            try:
++                from hermes_cli.tips import get_random_tip
++                _tip = get_random_tip()
+                 try:
+-                    from hermes_cli.config import get_config_path as _get_cfg_path_resid
+-                    mark_seen(_get_cfg_path_resid(), OPENCLAW_RESIDUE_FLAG)
++                    _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B") if _welcome_skin else "#B8860B"
+                 except Exception:
+-                    pass  # best-effort — banner will fire again next session
+-        except Exception:
+-            pass  # banner is non-critical — never break startup
+-        # Show a random tip to help users discover features
+-        try:
+-            from hermes_cli.tips import get_random_tip
+-            _tip = get_random_tip()
+-            try:
+-                _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
++                    _tip_color = "#B8860B"
++                self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+             except Exception:
+-                _tip_color = "#B8860B"
+-            self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+-        except Exception:
+-            pass  # Tips are non-critical — never break startup
++                pass  # Tips are non-critical — never break startup
+ 
+         # Curator — kick off a background skill-maintenance pass on startup
+         # if the schedule says we're due.  Runs in a daemon thread so it
+@@ -15159,7 +15168,7 @@ def main(
+     max_turns: int = None,
+     verbose: Optional[bool] = None,
+     quiet: bool = False,
+-    compact: bool = False,
++    compact: bool | None = None,
+     list_tools: bool = False,
+     list_toolsets: bool = False,
+     gateway: bool = False,
+@@ -15284,6 +15293,9 @@ def main(
+             _coding = None
+         if _coding is not None:
+             toolsets_list = _coding
++        elif os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1" and not query and not image:
++            # ponytail: placeholder; first real turn resolves platform tools after plugins load.
++            toolsets_list = []
+         else:
+             # Use the shared resolver so MCP servers are included at runtime
+             from hermes_cli.tools_config import _get_platform_tools
+@@ -15306,6 +15318,14 @@ def main(
+         pass_session_id=pass_session_id,
+         ignore_rules=ignore_rules,
+     )
++    if (
++        not toolsets
++        and toolsets_list == []
++        and os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1"
++        and not query
++        and not image
++    ):
++        cli._deferred_toolset_resolution = True
+ 
+     if parsed_skills:
+         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index a71d88356..69d4a64ed 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -228,6 +228,14 @@ class CLIAgentSetupMixin:
+             return True
+ 
+         _prepare_deferred_agent_startup()
++        if getattr(self, "_deferred_toolset_resolution", False):
++            try:
++                from cli import CLI_CONFIG
++                from hermes_cli.tools_config import _get_platform_tools
++
++                self.enabled_toolsets = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
++            finally:
++                self._deferred_toolset_resolution = False
+         self._install_tool_callbacks()
+         self._ensure_tirith_security()
+ 
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index b87125474..afcd07908 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1600,6 +1600,12 @@ DEFAULT_CONFIG = {
+     
+     "display": {
+         "compact": False,
++        # Show the startup banner/welcome/tip block in interactive CLI sessions.
++        # Disable for the fastest path to the first prompt.
++        "startup_banner": True,
++        # Show the one-line model/tool/provider summary under the compact startup
++        # banner. Disable to avoid resolving tool schemas before the first prompt.
++        "startup_status": True,
+         "personality": "",
+         "resume_display": "full",
+         # Recap tuning for /resume and startup resume. The defaults match the
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 0ca290a8f..253e6c68c 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2392,7 +2392,7 @@ def cmd_chat(args):
+         "max_turns": getattr(args, "max_turns", None),
+         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
+         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
+-        "compact": getattr(args, "compact", False),
++        "compact": getattr(args, "compact", None),
+     }
+     # Filter out None values
+     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+@@ -11798,6 +11798,15 @@ def _should_background_mcp_startup(args) -> bool:
+     return args.command in {None, "chat", "rl"}
+ 
+ 
++def _is_interactive_chat_prompt(args) -> bool:
++    return (
++        getattr(args, "command", None) in {None, "chat"}
++        and not getattr(args, "query", None)
++        and not getattr(args, "image", None)
++        and not getattr(args, "oneshot", None)
++    )
++
++
+ def _prepare_agent_startup(args) -> None:
+     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
+@@ -11808,15 +11817,20 @@ def _prepare_agent_startup(args) -> None:
+         return
+ 
+     _accept_hooks = bool(getattr(args, "accept_hooks", False))
+-    try:
+-        from hermes_cli.plugins import discover_plugins
++    if _is_interactive_chat_prompt(args):
++        os.environ["HERMES_DEFER_AGENT_STARTUP"] = "1"
++        if _accept_hooks:
++            os.environ["HERMES_ACCEPT_HOOKS"] = "1"
++    if not _is_interactive_chat_prompt(args):
++        try:
++            from hermes_cli.plugins import discover_plugins
+ 
+-        discover_plugins()
+-    except Exception:
+-        logger.warning(
+-            "plugin discovery failed at CLI startup",
+-            exc_info=True,
+-        )
++            discover_plugins()
++        except Exception:
++            logger.warning(
++                "plugin discovery failed at CLI startup",
++                exc_info=True,
++            )
+     _run_inline_mcp_discovery = True
+     if _is_tui_chat_launch(args):
+         # The TUI launcher hands off to a dedicated startup path that already
+@@ -11853,16 +11867,17 @@ def _prepare_agent_startup(args) -> None:
+                 "MCP tool discovery failed at CLI startup",
+                 exc_info=True,
+             )
+-    try:
+-        from hermes_cli.config import load_config
+-        from agent.shell_hooks import register_from_config
++    if not _is_interactive_chat_prompt(args):
++        try:
++            from hermes_cli.config import load_config
++            from agent.shell_hooks import register_from_config
+ 
+-        register_from_config(load_config(), accept_hooks=_accept_hooks)
+-    except Exception:
+-        logger.debug(
+-            "shell-hook registration failed at CLI startup",
+-            exc_info=True,
+-        )
++            register_from_config(load_config(), accept_hooks=_accept_hooks)
++        except Exception:
++            logger.debug(
++                "shell-hook registration failed at CLI startup",
++                exc_info=True,
++            )
+ 
+ 
+ def _set_chat_arg_defaults(args) -> None:
+diff --git a/tests/cli/test_cli_preloaded_skills.py b/tests/cli/test_cli_preloaded_skills.py
+index 9dc5f4fee..ff19258fb 100644
+--- a/tests/cli/test_cli_preloaded_skills.py
++++ b/tests/cli/test_cli_preloaded_skills.py
+@@ -125,3 +125,38 @@ def test_show_banner_does_not_print_skills():
+     startup_lines = [line for line in print_calls if "Activated skills:" in line]
+     assert len(startup_lines) == 0
+     assert mock_banner.call_count == 1
++
++
++def test_compact_banner_can_skip_startup_status_tool_resolution():
++    cli_obj = _make_real_cli(compact=True)
++    cli_obj.startup_status = False
++    cli_obj.console = MagicMock()
++
++    with patch("cli.get_tool_definitions") as mock_get_tools:
++        cli_obj.show_banner()
++
++    mock_get_tools.assert_not_called()
++
++
++def test_deferred_startup_preserves_coding_toolset_selection(monkeypatch):
++    import agent.coding_context as coding_context
++    import cli as cli_mod
++
++    created = {}
++
++    def fake_cli(**kwargs):
++        cli_obj = _DummyCLI(**kwargs)
++        setattr(cli_obj, "_deferred_toolset_resolution", False)
++        created["cli"] = cli_obj
++        return cli_obj
++
++    monkeypatch.setenv("HERMES_DEFER_AGENT_STARTUP", "1")
++    monkeypatch.setattr(coding_context, "coding_selection", lambda **_kwargs: ["coding", "project"])
++    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
++
++    with pytest.raises(SystemExit):
++        cli_mod.main(list_tools=True)
++
++    cli_obj = created["cli"]
++    assert cli_obj.kwargs["toolsets"] == ["coding", "project"]
++    assert getattr(cli_obj, "_deferred_toolset_resolution") is False
+diff --git a/tests/hermes_cli/test_tui_resume_flow.py b/tests/hermes_cli/test_tui_resume_flow.py
+index ad8ffbe79..c2ac56c90 100644
+--- a/tests/hermes_cli/test_tui_resume_flow.py
++++ b/tests/hermes_cli/test_tui_resume_flow.py
+@@ -620,6 +620,52 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
+     }
+ 
+ 
++def test_prepare_agent_startup_skips_plugin_discovery_for_interactive_chat(monkeypatch, main_mod):
++    calls = []
++    monkeypatch.setitem(
++        sys.modules,
++        "hermes_cli.plugins",
++        types.SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
++    )
++    monkeypatch.setitem(
++        sys.modules,
++        "hermes_cli.mcp_startup",
++        types.SimpleNamespace(start_background_mcp_discovery=lambda **_kwargs: None),
++    )
++    monkeypatch.setitem(
++        sys.modules,
++        "agent.shell_hooks",
++        types.SimpleNamespace(register_from_config=lambda *_args, **_kwargs: calls.append("hooks")),
++    )
++
++    main_mod._prepare_agent_startup(Namespace(command=None, query=None, image=None, oneshot=None))
++
++    assert calls == []
++
++
++def test_prepare_agent_startup_discovers_plugins_for_single_query(monkeypatch, main_mod):
++    calls = []
++    monkeypatch.setitem(
++        sys.modules,
++        "hermes_cli.plugins",
++        types.SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
++    )
++    monkeypatch.setitem(
++        sys.modules,
++        "hermes_cli.mcp_startup",
++        types.SimpleNamespace(start_background_mcp_discovery=lambda **_kwargs: None),
++    )
++    monkeypatch.setitem(
++        sys.modules,
++        "agent.shell_hooks",
++        types.SimpleNamespace(register_from_config=lambda *_args, **_kwargs: None),
++    )
++
++    main_mod._prepare_agent_startup(Namespace(command="chat", query="hi", image=None, oneshot=None))
++
++    assert calls == ["plugins"]
++
++
+ def _stub_plugin_discovery(monkeypatch):
+     monkeypatch.setitem(
+         sys.modules,
+-- 
+2.54.0
+

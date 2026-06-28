@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quill Hermes Nix <nix@localhost>
+Date: Sat, 27 Jun 2026 18:34:50 -0700
+Subject: [PATCH 18/19] fix: skip Ollama context probe for OpenRouter
+
+OpenRouter startup was paying a speculative /api/show request before reading its own model metadata. Scope that Ollama-native probe to Ollama providers; unknown custom endpoints still use the earlier provider-agnostic probe.
+
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 444ad6525..6ce4ffddc 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -1910,16 +1910,11 @@ def get_model_context_length(
+         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+         if ctx is not None:
+             return ctx
+-    # 5e. Ollama native /api/show probe — runs for ANY provider with a
+-    # base_url, not just ollama-cloud.  Ollama-compatible servers expose
+-    # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
+-    # custom Ollama hosting).  The OpenAI-compat /v1/models endpoint
+-    # correctly omits context_length per the OpenAI schema, but /api/show
+-    # returns the authoritative GGUF model_info.context_length.
+-    # For non-Ollama servers (OpenAI, Anthropic, etc.), the POST returns
+-    # 404/405 quickly.  Results are cached, so the hit is per-model+URL,
+-    # once per hour.
+-    if base_url:
++    # 5e. Ollama native /api/show probe.  Keep this scoped to Ollama-shaped
++    # providers: known non-Ollama providers do not need a speculative network
++    # miss on every uncached agent startup.  Unknown/custom endpoints already
++    # get the provider-agnostic probe in step 2b above.
++    if base_url and effective_provider in {"ollama", "ollama-cloud"}:
+         ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+         if ctx is not None:
+             save_context_length(model, base_url, ctx)
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index a18d9fb46..0fe2923b5 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -280,6 +280,23 @@ class TestDefaultContextLengths:
+                 "anthropic/claude-haiku-4.5", base_url=or_url, provider="openrouter"
+             ) == 200_000
+ 
++    def test_openrouter_context_lookup_skips_ollama_probe(self):
++        """OpenRouter startup must not pay a speculative /api/show miss."""
++        from agent.model_metadata import get_model_context_length
++        from unittest.mock import patch as mock_patch
++
++        or_url = "https://openrouter.ai/api/v1"
++        live = {"anthropic/claude-fable-5": {"context_length": 1_000_000}}
++        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value=live), \
++             mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None) as ollama_probe, \
++             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
++             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
++            assert get_model_context_length(
++                "anthropic/claude-fable-5", base_url=or_url, provider="openrouter"
++            ) == 1_000_000
++
++        ollama_probe.assert_not_called()
++
+     def test_openrouter_kimi_32k_underreport_still_guarded(self):
+         """The live OR branch keeps the Kimi-family 32k underreport guard:
+         a bogus 32768 from OpenRouter for a Kimi slug must NOT win — it falls
+-- 
+2.54.0
+
