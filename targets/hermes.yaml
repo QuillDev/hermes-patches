@@ -2,7 +2,7 @@ name: hermes
 upstream_url: https://github.com/NousResearch/hermes-agent.git
 upstream_remote_name: upstream
 upstream_branch: main
-base_commit: ef17cd204d7583c31fe1ace9255077f8c736b47e
+base_commit: 32732a8f8350f9c0d8522fe5473f16293b8b3427
 patch_dir: patches/hermes
 work_dir: .work
 upstream_cache: .work/upstream.git
