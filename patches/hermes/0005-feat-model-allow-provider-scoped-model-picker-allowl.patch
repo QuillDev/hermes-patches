@@ -273,5 +273,5 @@ index d33c7ff65..601ab71a8 100644
      """``build_models_payload`` is a thin shape adapter — it delegates the
      actual curation to ``list_authenticated_providers`` (which DOES call
 -- 
-2.54.0
+2.52.0
 

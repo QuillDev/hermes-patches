@@ -10,10 +10,10 @@ For bare interactive chat, defer plugin discovery, shell-hook registration, and 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/cli.py b/cli.py
-index 101ac997d..3a0376276 100644
+index e2069486f..8d3f756bd 100644
 --- a/cli.py
 +++ b/cli.py
-@@ -929,7 +929,7 @@ def _mark_tui_input_modes_active() -> None:
+@@ -937,7 +937,7 @@ def _mark_tui_input_modes_active() -> None:
  
  
  def _prepare_deferred_agent_startup() -> None:
@@ -22,7 +22,7 @@ index 101ac997d..3a0376276 100644
      global _deferred_agent_startup_done
      if _deferred_agent_startup_done:
          return
-@@ -956,7 +956,7 @@ def _prepare_deferred_agent_startup() -> None:
+@@ -964,7 +964,7 @@ def _prepare_deferred_agent_startup() -> None:
  
          start_background_mcp_discovery(
              logger=logger,
@@ -31,7 +31,7 @@ index 101ac997d..3a0376276 100644
          )
      except Exception:
          logger.debug(
-@@ -3443,7 +3443,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -3599,7 +3599,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          base_url: str = None,
          max_turns: int = None,
          verbose: Optional[bool] = None,
@@ -40,7 +40,7 @@ index 101ac997d..3a0376276 100644
          resume: str = None,
          checkpoints: bool = False,
          pass_session_id: bool = False,
-@@ -3468,6 +3468,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -3624,6 +3624,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          self.console = Console()
          self.config = CLI_CONFIG
          self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
@@ -49,7 +49,7 @@ index 101ac997d..3a0376276 100644
          # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
          # YAML 1.1 parses bare `off` as boolean False — normalise to string.
          _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
-@@ -3629,6 +3631,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -3785,6 +3787,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          
          # Parse and validate toolsets
          self.enabled_toolsets = toolsets
@@ -57,7 +57,7 @@ index 101ac997d..3a0376276 100644
          self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
  
          if toolsets and "all" not in toolsets and "*" not in toolsets:
-@@ -5863,7 +5866,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -6051,7 +6054,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          
          if use_compact:
              self._console_print(_build_compact_banner())
@@ -67,7 +67,7 @@ index 101ac997d..3a0376276 100644
          else:
              # Get tools for display
              tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-@@ -5883,8 +5887,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -6071,8 +6075,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  provider=self.provider,
              )
          
@@ -78,7 +78,7 @@ index 101ac997d..3a0376276 100644
          if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
              self._show_tool_availability_warnings()
  
-@@ -6183,7 +6187,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -6371,7 +6375,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
      
      def _show_status(self):
          """Show compact startup status line."""
@@ -87,7 +87,7 @@ index 101ac997d..3a0376276 100644
          if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
              tool_status = "tools deferred"
          else:
-@@ -12555,18 +12559,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12852,18 +12856,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              _detect_light_mode()
          except Exception:
              pass
@@ -118,7 +118,7 @@ index 101ac997d..3a0376276 100644
          # Surface any active supply-chain security advisories right after the
          # welcome banner. Quiet/single-query paths call this themselves.
          self._show_security_advisories()
-@@ -12576,15 +12581,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12873,15 +12878,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              if self._preload_resumed_session():
                  self._display_resumed_history()
  
@@ -145,7 +145,7 @@ index 101ac997d..3a0376276 100644
  
          # Warm the /model picker's provider-models cache off-thread during this
          # idle window (banner shown, user about to type). The no-args picker
-@@ -12613,41 +12620,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12910,41 +12917,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  )
          except Exception:
              pass
@@ -221,7 +221,7 @@ index 101ac997d..3a0376276 100644
  
          # Curator — kick off a background skill-maintenance pass on startup
          # if the schedule says we're due.  Runs in a daemon thread so it
-@@ -15159,7 +15168,7 @@ def main(
+@@ -15453,7 +15462,7 @@ def main(
      max_turns: int = None,
      verbose: Optional[bool] = None,
      quiet: bool = False,
@@ -230,7 +230,7 @@ index 101ac997d..3a0376276 100644
      list_tools: bool = False,
      list_toolsets: bool = False,
      gateway: bool = False,
-@@ -15284,6 +15293,9 @@ def main(
+@@ -15578,6 +15587,9 @@ def main(
              _coding = None
          if _coding is not None:
              toolsets_list = _coding
@@ -240,7 +240,7 @@ index 101ac997d..3a0376276 100644
          else:
              # Use the shared resolver so MCP servers are included at runtime
              from hermes_cli.tools_config import _get_platform_tools
-@@ -15306,6 +15318,14 @@ def main(
+@@ -15600,6 +15612,14 @@ def main(
          pass_session_id=pass_session_id,
          ignore_rules=ignore_rules,
      )
@@ -275,10 +275,10 @@ index a71d88356..69d4a64ed 100644
          self._ensure_tirith_security()
  
 diff --git a/hermes_cli/config.py b/hermes_cli/config.py
-index b87125474..afcd07908 100644
+index 17f506a5d..1a29960ed 100644
 --- a/hermes_cli/config.py
 +++ b/hermes_cli/config.py
-@@ -1600,6 +1600,12 @@ DEFAULT_CONFIG = {
+@@ -1639,6 +1639,12 @@ DEFAULT_CONFIG = {
      
      "display": {
          "compact": False,
@@ -292,10 +292,10 @@ index b87125474..afcd07908 100644
          "resume_display": "full",
          # Recap tuning for /resume and startup resume. The defaults match the
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 0ca290a8f..253e6c68c 100644
+index aedcb603e..59d0ba637 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
-@@ -2392,7 +2392,7 @@ def cmd_chat(args):
+@@ -2396,7 +2396,7 @@ def cmd_chat(args):
          "max_turns": getattr(args, "max_turns", None),
          "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
          "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
@@ -304,7 +304,7 @@ index 0ca290a8f..253e6c68c 100644
      }
      # Filter out None values
      kwargs = {k: v for k, v in kwargs.items() if v is not None}
-@@ -11798,6 +11798,15 @@ def _should_background_mcp_startup(args) -> bool:
+@@ -12052,6 +12052,15 @@ def _should_background_mcp_startup(args) -> bool:
      return args.command in {None, "chat", "rl"}
  
  
@@ -320,7 +320,7 @@ index 0ca290a8f..253e6c68c 100644
  def _prepare_agent_startup(args) -> None:
      """Discover plugins/MCP/hooks for commands that can run an agent turn."""
      _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
-@@ -11808,15 +11817,20 @@ def _prepare_agent_startup(args) -> None:
+@@ -12062,15 +12071,20 @@ def _prepare_agent_startup(args) -> None:
          return
  
      _accept_hooks = bool(getattr(args, "accept_hooks", False))
@@ -349,7 +349,7 @@ index 0ca290a8f..253e6c68c 100644
      _run_inline_mcp_discovery = True
      if _is_tui_chat_launch(args):
          # The TUI launcher hands off to a dedicated startup path that already
-@@ -11853,16 +11867,17 @@ def _prepare_agent_startup(args) -> None:
+@@ -12107,16 +12121,17 @@ def _prepare_agent_startup(args) -> None:
                  "MCP tool discovery failed at CLI startup",
                  exc_info=True,
              )
@@ -420,7 +420,7 @@ index 9dc5f4fee..ff19258fb 100644
 +    assert cli_obj.kwargs["toolsets"] == ["coding", "project"]
 +    assert getattr(cli_obj, "_deferred_toolset_resolution") is False
 diff --git a/tests/hermes_cli/test_tui_resume_flow.py b/tests/hermes_cli/test_tui_resume_flow.py
-index ad8ffbe79..c2ac56c90 100644
+index 2b6305ac8..ed3e48212 100644
 --- a/tests/hermes_cli/test_tui_resume_flow.py
 +++ b/tests/hermes_cli/test_tui_resume_flow.py
 @@ -620,6 +620,52 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
@@ -477,5 +477,5 @@ index ad8ffbe79..c2ac56c90 100644
      monkeypatch.setitem(
          sys.modules,
 -- 
-2.54.0
+2.52.0
 

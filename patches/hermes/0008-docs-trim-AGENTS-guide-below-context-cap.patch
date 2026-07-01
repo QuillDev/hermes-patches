@@ -5,10 +5,10 @@ Subject: [PATCH 08/19] docs: trim AGENTS guide below context cap
 
 
 diff --git a/AGENTS.md b/AGENTS.md
-index 30deedf5b..f1908e63a 100644
+index e89c81984..69b71dea7 100644
 --- a/AGENTS.md
 +++ b/AGENTS.md
-@@ -634,90 +634,12 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
+@@ -645,90 +645,12 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
  
  ## Skin/Theme System
  
@@ -105,7 +105,7 @@ index 30deedf5b..f1908e63a 100644
  
  ---
  
-@@ -852,83 +774,31 @@ Top-level `tags:` and `category:` are also accepted and mirrored from
+@@ -881,83 +803,31 @@ Top-level `tags:` and `category:` are also accepted and mirrored from
  
  ### Skill authoring standards (HARDLINE)
  
@@ -214,7 +214,7 @@ index 30deedf5b..f1908e63a 100644
  
  ---
  
-@@ -953,146 +823,46 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
+@@ -982,146 +852,46 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
  
  ## Delegation (`delegate_task`)
  
@@ -385,5 +385,5 @@ index 30deedf5b..f1908e63a 100644
  ---
  
 -- 
-2.54.0
+2.52.0
 

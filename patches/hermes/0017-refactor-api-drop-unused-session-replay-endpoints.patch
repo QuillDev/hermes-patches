@@ -201,10 +201,10 @@ index b526e9344..000000000
 -scripts/run_tests.sh tests/gateway/test_session_api.py
 -```
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 07b7c03ca..f3fdf3622 100644
+index c3d68a2fa..4a5b4395a 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1896,7 +1896,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1921,7 +1921,6 @@ class APIServerAdapter(BasePlatformAdapter):
                  "session_resources": True,
                  "session_chat": True,
                  "session_chat_streaming": True,
@@ -212,7 +212,7 @@ index 07b7c03ca..f3fdf3622 100644
                  "session_subscribe_sse": True,
                  "session_fork": True,
                  "session_archiving": True,
-@@ -1937,8 +1936,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1962,8 +1961,6 @@ class APIServerAdapter(BasePlatformAdapter):
                  "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                  "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                  "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -221,7 +221,7 @@ index 07b7c03ca..f3fdf3622 100644
              },
          })
  
-@@ -2556,89 +2553,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2581,89 +2578,6 @@ class APIServerAdapter(BasePlatformAdapter):
              "has_more": len(events) == limit,
          })
  
@@ -311,7 +311,7 @@ index 07b7c03ca..f3fdf3622 100644
      async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
          """GET /api/sessions — list persisted Hermes sessions."""
          auth_err = self._check_auth(request)
-@@ -2862,62 +2776,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2888,62 +2802,6 @@ class APIServerAdapter(BasePlatformAdapter):
          fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
          return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
  
@@ -374,7 +374,7 @@ index 07b7c03ca..f3fdf3622 100644
      async def _handle_session_subscribe(self, request: "web.Request") -> "web.StreamResponse":
          """GET /api/sessions/{session_id}/subscribe — snapshot + live SSE."""
          auth_err = self._check_auth(request)
-@@ -6517,8 +6375,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -6607,8 +6465,6 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_get("/v1/sessions/{session_id}/state", self._handle_session_state)
              self._app.router.add_get("/v1/sessions/{session_id}/items", self._handle_session_items)
              self._app.router.add_get("/v1/sessions/{session_id}/events", self._handle_session_events)
@@ -383,7 +383,7 @@ index 07b7c03ca..f3fdf3622 100644
              self._app.router.add_get("/api/sessions", self._handle_list_sessions)
              self._app.router.add_post("/api/sessions", self._handle_create_session)
              self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
-@@ -6526,8 +6382,6 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -6616,8 +6472,6 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
              self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
              self._app.router.add_get("/api/sessions/{session_id}/subscribe", self._handle_session_subscribe)
@@ -393,10 +393,10 @@ index 07b7c03ca..f3fdf3622 100644
              self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
              self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
 diff --git a/hermes_state.py b/hermes_state.py
-index 852de22c6..90d6a0ebb 100644
+index 35cde1993..3d83c0f94 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -686,16 +686,6 @@ CREATE TABLE IF NOT EXISTS session_events (
+@@ -791,16 +791,6 @@ CREATE TABLE IF NOT EXISTS session_events (
      created_at REAL NOT NULL
  );
  
@@ -413,7 +413,7 @@ index 852de22c6..90d6a0ebb 100644
  CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
  CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
  CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
-@@ -1357,48 +1347,6 @@ class SessionDB:
+@@ -1496,48 +1486,6 @@ class SessionDB:
              return None
          return str(row["max_id"])
  
@@ -653,5 +653,5 @@ index a4157c4ec..203204654 100644
      assert run_id in body
  
 -- 
-2.54.0
+2.52.0
 

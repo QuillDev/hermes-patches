@@ -206,10 +206,10 @@ index 000000000..b526e9344
 +scripts/run_tests.sh tests/gateway/test_session_api.py
 +```
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 4d8382de4..35b61c6a6 100644
+index e17e97136..4669d2b40 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1666,6 +1666,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1691,6 +1691,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  "session_chat": True,
                  "session_chat_streaming": True,
                  "session_run_replay": True,
@@ -217,7 +217,7 @@ index 4d8382de4..35b61c6a6 100644
                  "session_fork": True,
                  "unified_session_create": True,
                  "workspace_resources": True,
-@@ -1700,6 +1701,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1725,6 +1726,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                  "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                  "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
@@ -225,7 +225,7 @@ index 4d8382de4..35b61c6a6 100644
                  "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                  "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                  "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
-@@ -2090,6 +2092,42 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2115,6 +2117,42 @@ class APIServerAdapter(BasePlatformAdapter):
              payload["active"] = True
          return payload
  
@@ -268,7 +268,7 @@ index 4d8382de4..35b61c6a6 100644
      def _record_response_session_event(
          self,
          *,
-@@ -2382,7 +2420,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2407,7 +2445,7 @@ class APIServerAdapter(BasePlatformAdapter):
          )
          return web.json_response({
              "object": "list",
@@ -277,7 +277,7 @@ index 4d8382de4..35b61c6a6 100644
              "limit": limit,
              "offset": offset,
              "has_more": len(sessions) == limit,
-@@ -2433,7 +2471,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2459,7 +2497,7 @@ class APIServerAdapter(BasePlatformAdapter):
          session, err = self._get_existing_session_or_404(request.match_info["session_id"])
          if err:
              return err
@@ -286,7 +286,7 @@ index 4d8382de4..35b61c6a6 100644
  
      async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
          """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
-@@ -2597,6 +2635,97 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2623,6 +2661,97 @@ class APIServerAdapter(BasePlatformAdapter):
              logger.debug("[api_server] session run replay stream error for %s: %s", run_id, exc)
          return response
  
@@ -384,7 +384,7 @@ index 4d8382de4..35b61c6a6 100644
      async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
          """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
          auth_err = self._check_auth(request)
-@@ -6064,6 +6193,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -6154,6 +6283,7 @@ class APIServerAdapter(BasePlatformAdapter):
              self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
              self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
              self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
@@ -564,5 +564,5 @@ index c1a78c4c1..11f08c47e 100644
      db_path = tmp_path / "response_store.db"
      store = ResponseStore(db_path=str(db_path))
 -- 
-2.54.0
+2.52.0
 

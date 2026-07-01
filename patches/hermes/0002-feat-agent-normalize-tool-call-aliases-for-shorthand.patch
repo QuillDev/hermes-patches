@@ -12,10 +12,10 @@ tool_call objects and raw dict tool calls.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 8503a7f90..f30c1ed3a 100644
+index be8036253..d43a05a4c 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -3974,6 +3974,12 @@ def run_conversation(
+@@ -4276,6 +4276,12 @@ def run_conversation(
                          if repaired:
                              print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                              tc.function.name = repaired
@@ -257,5 +257,5 @@ index 000000000..2b03c7e3f
 +        "context": 2,
 +    }
 -- 
-2.54.0
+2.52.0
 

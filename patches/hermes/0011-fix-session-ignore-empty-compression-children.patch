@@ -6,10 +6,10 @@ Subject: [PATCH 11/19] fix(session): ignore empty compression children
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/hermes_state.py b/hermes_state.py
-index 563641c4f..b54a33e3e 100644
+index 088bc5cdc..74716f6fb 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -51,7 +51,9 @@ _BRANCH_CHILD_SQL = (
+@@ -53,7 +53,9 @@ _BRANCH_CHILD_SQL = (
  _COMPRESSION_CHILD_SQL = (
      "EXISTS (SELECT 1 FROM sessions p"
      "        WHERE p.id = {a}.parent_session_id"
@@ -20,7 +20,7 @@ index 563641c4f..b54a33e3e 100644
  )
  
  # Rows that surface in pickers: roots + branch children (subagent runs and
-@@ -2395,11 +2397,12 @@ class SessionDB:
+@@ -2781,11 +2783,12 @@ class SessionDB:
          The continuation edge is the canonical one shared with
          :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
          (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
@@ -38,7 +38,7 @@ index 563641c4f..b54a33e3e 100644
          """
          if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
              return False
-@@ -2503,6 +2506,8 @@ class SessionDB:
+@@ -2889,6 +2892,8 @@ class SessionDB:
                      JOIN sessions child ON child.id = a.id
                      JOIN sessions parent ON parent.id = child.parent_session_id
                      WHERE parent.end_reason = 'compression'
@@ -47,7 +47,7 @@ index 563641c4f..b54a33e3e 100644
                    ),
                    descendants(id) AS (
                      SELECT ?
-@@ -2512,6 +2517,8 @@ class SessionDB:
+@@ -2898,6 +2903,8 @@ class SessionDB:
                      JOIN sessions parent ON parent.id = d.id
                      JOIN sessions child ON child.parent_session_id = parent.id
                      WHERE parent.end_reason = 'compression'
@@ -56,7 +56,7 @@ index 563641c4f..b54a33e3e 100644
                    ),
                    lineage(id) AS (
                      SELECT id FROM ancestors
-@@ -2608,22 +2615,22 @@ class SessionDB:
+@@ -2994,22 +3001,22 @@ class SessionDB:
          """Walk the compression-continuation chain forward and return the tip.
  
          A compression continuation is a child of a session whose
@@ -95,7 +95,7 @@ index 563641c4f..b54a33e3e 100644
          """
          current = session_id
          seen = {current} if current else set()
-@@ -2638,6 +2645,8 @@ class SessionDB:
+@@ -3024,6 +3031,8 @@ class SessionDB:
                      JOIN sessions child ON child.parent_session_id = parent.id
                      WHERE parent.id = ?
                        AND parent.end_reason = 'compression'
@@ -104,7 +104,7 @@ index 563641c4f..b54a33e3e 100644
                        AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                        AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
                        AND COALESCE(child.source, '') != 'tool'
-@@ -2831,6 +2840,8 @@ class SessionDB:
+@@ -3217,6 +3226,8 @@ class SessionDB:
                      JOIN sessions parent ON parent.id = c.cur_id
                      JOIN sessions child ON child.parent_session_id = c.cur_id
                      WHERE parent.end_reason = 'compression'
@@ -141,5 +141,5 @@ index 36ecb95a1..c80cf6a44 100644
 +    assert db.resolve_resume_session_id("root") == "tip"
 +    assert [s["id"] for s in db.list_sessions_rich(order_by_last_active=True)] == ["tip"]
 -- 
-2.54.0
+2.52.0
 

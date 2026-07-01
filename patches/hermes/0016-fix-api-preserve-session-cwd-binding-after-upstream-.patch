@@ -7,10 +7,10 @@ Subject: [PATCH 16/19] fix(api): preserve session cwd binding after upstream
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 25c00c0ac..07b7c03ca 100644
+index 8f3a3636f..c3d68a2fa 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -5577,6 +5577,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5614,6 +5614,7 @@ class APIServerAdapter(BasePlatformAdapter):
          chat_id: str = "",
          session_key: str = "",
          session_id: str = "",
@@ -18,7 +18,7 @@ index 25c00c0ac..07b7c03ca 100644
      ) -> list:
          """Bind session contextvars for an API-server agent run.
  
-@@ -5600,6 +5601,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5637,6 +5638,7 @@ class APIServerAdapter(BasePlatformAdapter):
              chat_id=chat_id,
              session_key=session_key,
              session_id=session_id,
@@ -27,10 +27,10 @@ index 25c00c0ac..07b7c03ca 100644
          )
  
 diff --git a/hermes_state.py b/hermes_state.py
-index b54a33e3e..852de22c6 100644
+index 74716f6fb..35cde1993 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -2394,21 +2394,14 @@ class SessionDB:
+@@ -2780,21 +2780,14 @@ class SessionDB:
          """Return True if *ancestor_id* is a compression predecessor of
          *descendant_id* (walking parent links up the continuation chain).
  
@@ -57,7 +57,7 @@ index b54a33e3e..852de22c6 100644
          row = conn.execute(
              f"""
              WITH RECURSIVE ancestors(id) AS (
-@@ -2418,7 +2411,10 @@ class SessionDB:
+@@ -2804,7 +2797,10 @@ class SessionDB:
                  FROM ancestors a
                  JOIN sessions child ON child.id = a.id
                  JOIN sessions parent ON parent.id = child.parent_session_id
@@ -70,5 +70,5 @@ index b54a33e3e..852de22c6 100644
              SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
              """,
 -- 
-2.54.0
+2.52.0
 

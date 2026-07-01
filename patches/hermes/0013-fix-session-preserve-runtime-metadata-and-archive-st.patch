@@ -76,12 +76,12 @@ index 000000000..4dbbab5cd
 +  })
 +})
 diff --git a/apps/desktop/src/app/agents/index.tsx b/apps/desktop/src/app/agents/index.tsx
-index 8f6c2349f..72f055ce7 100644
+index fd1375859..6c03959d2 100644
 --- a/apps/desktop/src/app/agents/index.tsx
 +++ b/apps/desktop/src/app/agents/index.tsx
 @@ -21,16 +21,21 @@ import {
  
- import { OverlayView } from '../overlays/overlay-view'
+ import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
  
 -// Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 -// same visual vocabulary as the chat tool blocks.
@@ -117,11 +117,11 @@ index 8f6c2349f..72f055ce7 100644
  }
  
  const STREAM_TONE: Record<SubagentStreamEntry['kind'], string> = {
-diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.ts b/apps/desktop/src/app/session/hooks/use-session-actions.ts
-index a25dc550b..77ed3d2da 100644
---- a/apps/desktop/src/app/session/hooks/use-session-actions.ts
-+++ b/apps/desktop/src/app/session/hooks/use-session-actions.ts
-@@ -29,6 +29,8 @@ import {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 32d7d6d56..88e382ea5 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -25,6 +25,8 @@ import {
    $messages,
    $sessions,
    $yoloActive,
@@ -130,7 +130,7 @@ index a25dc550b..77ed3d2da 100644
    sessionPinId,
    setActiveSessionId,
    setAwaitingResponse,
-@@ -1070,6 +1072,7 @@ export function useSessionActions({
+@@ -806,6 +808,7 @@ export function useSessionActions({
        // live tip after compression. Drop both so the pin can't linger.
        const removedPinId = removed ? sessionPinId(removed) : storedSessionId
  
@@ -138,7 +138,7 @@ index a25dc550b..77ed3d2da 100644
        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
        // Evict from the project tree's optimistic layer too (the backend snapshot
        // still lists it until its next refresh), so grouped + flat views drop the
-@@ -1098,6 +1101,9 @@ export function useSessionActions({
+@@ -834,6 +837,9 @@ export function useSessionActions({
            clearQueuedPrompts(closingRuntimeId)
          }
        } catch (err) {
@@ -148,7 +148,7 @@ index a25dc550b..77ed3d2da 100644
          if (removed) {
            setSessions(prev => [removed, ...prev])
            setSessionsTotal(prev => prev + 1)
-@@ -1157,6 +1163,7 @@ export function useSessionActions({
+@@ -893,6 +899,7 @@ export function useSessionActions({
        const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
  
        // Soft-hide: drop from the sidebar immediately, keep the data.
@@ -156,7 +156,7 @@ index a25dc550b..77ed3d2da 100644
        setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
        tombstoneSessions([storedSessionId, archived?.id, archived?._lineage_root_id])
        // Archived sessions are hidden by the listSessions(min_messages=1) query
-@@ -1179,6 +1186,9 @@ export function useSessionActions({
+@@ -915,6 +922,9 @@ export function useSessionActions({
          $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
          notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
        } catch (err) {
@@ -215,19 +215,22 @@ index 000000000..f9d4497eb
 +    expect(container.querySelector('svg')).toBeFalsy()
 +  })
 +})
-diff --git a/apps/desktop/src/components/assistant-ui/thread.tsx b/apps/desktop/src/components/assistant-ui/thread.tsx
-index 706345f70..a12703cab 100644
---- a/apps/desktop/src/components/assistant-ui/thread.tsx
-+++ b/apps/desktop/src/components/assistant-ui/thread.tsx
-@@ -83,7 +83,6 @@ import {
-   DropdownMenuLabel,
-   DropdownMenuTrigger
- } from '@/components/ui/dropdown-menu'
--import { Loader } from '@/components/ui/loader'
- import type { HermesGateway } from '@/hermes'
- import { useResizeObserver } from '@/hooks/use-resize-observer'
- import { useI18n } from '@/i18n'
-@@ -250,7 +249,7 @@ export const Thread: FC<{
+diff --git a/apps/desktop/src/components/assistant-ui/thread/index.tsx b/apps/desktop/src/components/assistant-ui/thread/index.tsx
+index ff30931e3..4ad4346b4 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/index.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/index.tsx
+@@ -4,8 +4,8 @@ import { AssistantMessage } from '@/components/assistant-ui/thread/assistant-mes
+ import { ThreadMessageList } from '@/components/assistant-ui/thread/list'
+ import {
+   BackgroundResumeNotice,
+-  CenteredThreadSpinner,
+-  ResponseLoadingIndicator
++  ResponseLoadingIndicator,
++  ThreadLoadingSkeleton
+ } from '@/components/assistant-ui/thread/status'
+ import { SystemMessage } from '@/components/assistant-ui/thread/system-message'
+ import { ThreadTimeline } from '@/components/assistant-ui/thread/timeline'
+@@ -103,7 +103,7 @@ export const Thread: FC<{
          loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
          sessionKey={sessionKey}
        />
@@ -236,12 +239,24 @@ index 706345f70..a12703cab 100644
        <ThreadTimeline />
        <ConfirmDialog
          confirmLabel={copy.restoreConfirm}
-@@ -275,27 +274,65 @@ function pickPrimaryPreviewTarget(targets: string[]): string[] {
-   return [localUrl || targets[targets.length - 1]]
- }
+diff --git a/apps/desktop/src/components/assistant-ui/thread/status.tsx b/apps/desktop/src/components/assistant-ui/thread/status.tsx
+index 53c6f415a..19c7d8563 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/status.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/status.tsx
+@@ -5,7 +5,6 @@ import { type FC, type ReactNode, useEffect, useState } from 'react'
+ import { useElapsedSeconds } from '@/components/chat/activity-timer'
+ import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+ import { Codicon } from '@/components/ui/codicon'
+-import { Loader } from '@/components/ui/loader'
+ import { useI18n } from '@/i18n'
+ import { cn } from '@/lib/utils'
+ import { $backgroundResume } from '@/store/background-delegation'
+@@ -36,27 +35,65 @@ const CompactionHint: FC = () => (
+   <span className="shimmer min-w-0 truncate text-muted-foreground/55">{COMPACTION_LABEL}</span>
+ )
  
--const CenteredThreadSpinner: FC = () => {
-+const ThreadLoadingSkeleton: FC = () => {
+-export const CenteredThreadSpinner: FC = () => {
++export const ThreadLoadingSkeleton: FC = () => {
    const { t } = useI18n()
  
    return (
@@ -309,9 +324,9 @@ index 706345f70..a12703cab 100644
 +  <span className="block h-3 rounded-full bg-muted-foreground/14" style={{ width: `${width}%` }} />
 +)
 +
- const AssistantMessage: FC<{
-   onBranchInNewChat?: (messageId: string) => void
-   onDismissError?: (messageId: string) => void
+ export const ResponseLoadingIndicator: FC = () => {
+   const { t } = useI18n()
+   const elapsed = useElapsedSeconds()
 diff --git a/apps/desktop/src/store/session.test.ts b/apps/desktop/src/store/session.test.ts
 index 013ad0efd..37802352f 100644
 --- a/apps/desktop/src/store/session.test.ts
@@ -433,10 +448,10 @@ index 2be408530..6983f0eb6 100644
  
    // Carry a known title onto a row that arrives title-less, so a freshly
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index c44c86355..25c00c0ac 100644
+index ab5a80ece..8f3a3636f 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1435,7 +1435,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1444,7 +1444,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  raise
              runtime_kwargs = {}
          reasoning_config = GatewayRunner._load_reasoning_config()
@@ -445,7 +460,7 @@ index c44c86355..25c00c0ac 100644
          if request_model_override:
              model = request_model_override.get("model") or model
              override_runtime = request_model_override.get("runtime") or {}
-@@ -1612,6 +1612,45 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1633,6 +1633,45 @@ class APIServerAdapter(BasePlatformAdapter):
                  runtime[key] = value
          return {"model": model, "provider": provider, "runtime": runtime}
  
@@ -491,7 +506,7 @@ index c44c86355..25c00c0ac 100644
      def _process_session_command(
          self,
          *,
-@@ -2114,20 +2153,28 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2139,20 +2178,28 @@ class APIServerAdapter(BasePlatformAdapter):
          session_id, err = self._new_client_session_id(body)
          if err is not None:
              return err
@@ -523,7 +538,7 @@ index c44c86355..25c00c0ac 100644
          return web.json_response(self._session_response(session), status=201)
  
      async def _create_unified_worktree_session(self, body: Dict[str, Any]) -> "web.Response":
-@@ -2159,7 +2206,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2184,7 +2231,7 @@ class APIServerAdapter(BasePlatformAdapter):
          except subprocess.CalledProcessError as exc:
              detail = (exc.stderr or exc.stdout or str(exc)).strip()
              return web.json_response(_openai_error(f"Failed to create worktree: {detail}", code="worktree_create_failed"), status=400)
@@ -532,7 +547,7 @@ index c44c86355..25c00c0ac 100644
              "nako_worktree": {
                  "workspace_id": workspace["id"],
                  "repo_path": workspace["repoPath"],
-@@ -2167,8 +2214,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2192,8 +2239,8 @@ class APIServerAdapter(BasePlatformAdapter):
                  "branch_name": branch_name,
                  "base_ref": base_ref,
              }
@@ -543,7 +558,7 @@ index c44c86355..25c00c0ac 100644
          system_prompt = body.get("system_prompt") or body.get("systemPrompt")
          if system_prompt is not None and not isinstance(system_prompt, str):
              return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
-@@ -2659,11 +2706,18 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2685,11 +2732,18 @@ class APIServerAdapter(BasePlatformAdapter):
          if db.get_session(session_id):
              return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
  
@@ -787,5 +802,5 @@ index de85fb8c5..a4157c4ec 100644
  
  @pytest.mark.asyncio
 -- 
-2.54.0
+2.52.0
 

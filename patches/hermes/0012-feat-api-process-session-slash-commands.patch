@@ -8,10 +8,10 @@ Add opt-in command handling for API session chat routes so /model can update the
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index a1eca13c0..c44c86355 100644
+index d8e8139d5..ab5a80ece 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -481,6 +481,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
+@@ -482,6 +482,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
      return None, err
  
  
@@ -46,7 +46,7 @@ index a1eca13c0..c44c86355 100644
  def check_api_server_requirements() -> bool:
      """Check if API server dependencies are available."""
      return AIOHTTP_AVAILABLE
-@@ -1549,6 +1577,170 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1570,6 +1598,170 @@ class APIServerAdapter(BasePlatformAdapter):
                  status=400,
              )
  
@@ -217,7 +217,7 @@ index a1eca13c0..c44c86355 100644
      # ------------------------------------------------------------------
      # HTTP Handlers
      # ------------------------------------------------------------------
-@@ -2787,6 +2979,18 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2813,6 +3005,18 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -236,7 +236,7 @@ index a1eca13c0..c44c86355 100644
          history = self._conversation_history_for_session(session_id)
          result, usage = await self._run_agent(
              user_message=user_message,
-@@ -2835,6 +3039,39 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2861,6 +3065,39 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -276,7 +276,7 @@ index a1eca13c0..c44c86355 100644
  
          loop = asyncio.get_running_loop()
          queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
-@@ -5390,6 +5627,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5427,6 +5664,8 @@ class APIServerAdapter(BasePlatformAdapter):
          another thread to stop in-progress LLM calls.
          """
          loop = asyncio.get_running_loop()
@@ -462,5 +462,5 @@ index b92231ac6..de85fb8c5 100644
  async def test_session_replay_api_exposes_stable_items_events_and_state(adapter, session_db):
      session_id = session_db.create_session("sync-session", "api_server")
 -- 
-2.54.0
+2.52.0
 

@@ -8,10 +8,10 @@ OpenRouter startup was paying a speculative /api/show request before reading its
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/model_metadata.py b/agent/model_metadata.py
-index 444ad6525..6ce4ffddc 100644
+index 547fe2f57..908b417ac 100644
 --- a/agent/model_metadata.py
 +++ b/agent/model_metadata.py
-@@ -1910,16 +1910,11 @@ def get_model_context_length(
+@@ -2076,16 +2076,11 @@ def get_model_context_length(
          ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
          if ctx is not None:
              return ctx
@@ -62,5 +62,5 @@ index a18d9fb46..0fe2923b5 100644
          """The live OR branch keeps the Kimi-family 32k underreport guard:
          a bogus 32768 from OpenRouter for a Kimi slug must NOT win — it falls
 -- 
-2.54.0
+2.52.0
 

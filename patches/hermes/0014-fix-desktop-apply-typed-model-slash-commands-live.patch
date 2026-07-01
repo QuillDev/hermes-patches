@@ -7,11 +7,11 @@ Route typed /model arguments through the desktop config RPC instead of the slash
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
-diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
-index bd971dd52..2e8fe0132 100644
---- a/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
-+++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.test.tsx
-@@ -304,6 +304,67 @@ describe('usePromptActions desktop slash pickers', () => {
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+index d0290aa27..fc6d3806a 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+@@ -305,6 +305,67 @@ describe('usePromptActions desktop slash pickers', () => {
      expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
    })
  
@@ -79,26 +79,20 @@ index bd971dd52..2e8fe0132 100644
    it('marks a timed-out handoff as failed so the next attempt can retry', async () => {
      vi.useFakeTimers()
      const calls: { method: string; params?: Record<string, unknown> }[] = []
-diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-index 6e2829d61..edad24067 100644
---- a/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-+++ b/apps/desktop/src/app/session/hooks/use-prompt-actions.ts
-@@ -81,6 +81,14 @@ interface HandoffResult {
-   error?: string
- }
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
+index 4d887f4ef..6a87669ca 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
+@@ -29,7 +29,7 @@ import {
+   setYoloActive
+ } from '@/store/session'
  
-+interface ConfigSetModelResponse {
-+  confirm_message?: string
-+  confirm_required?: boolean
-+  key?: string
-+  value?: string
-+  warning?: string
-+}
-+
- function delay(ms: number): Promise<void> {
-   return new Promise(resolve => setTimeout(resolve, ms))
- }
-@@ -1377,8 +1385,49 @@ export function usePromptActions({
+-import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
++import type { BrowserManageResponse, ConfigSetModelResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
+ 
+ import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText } from './utils'
+ 
+@@ -516,8 +516,49 @@ export function useSlashCommand(deps: SlashCommandDeps) {
              return
            }
  
@@ -150,6 +144,25 @@ index 6e2829d61..edad24067 100644
  
            return
          }
+diff --git a/apps/desktop/src/app/types.ts b/apps/desktop/src/app/types.ts
+index 1adc2bdec..161e36692 100644
+--- a/apps/desktop/src/app/types.ts
++++ b/apps/desktop/src/app/types.ts
+@@ -52,6 +52,14 @@ export interface BrowserManageResponse {
+   messages?: string[]
+ }
+ 
++export interface ConfigSetModelResponse {
++  confirm_message?: string
++  confirm_required?: boolean
++  key?: string
++  value?: string
++  warning?: string
++}
++
+ export interface SessionSteerResponse {
+   // 'queued' == accepted into the live turn's steer slot (injected at the next
+   // tool-result boundary); 'rejected' == no live tool window, caller queues.
 -- 
-2.54.0
+2.52.0
 

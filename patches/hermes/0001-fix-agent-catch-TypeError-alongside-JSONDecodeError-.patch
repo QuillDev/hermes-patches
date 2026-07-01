@@ -11,10 +11,10 @@ JSONDecodeError. Catch both to avoid crashing the adapter.
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
-index 4f9222597..07c509590 100644
+index c124205c1..4149b1561 100644
 --- a/agent/anthropic_adapter.py
 +++ b/agent/anthropic_adapter.py
-@@ -893,10 +893,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+@@ -905,10 +905,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
      raw = result.stdout.strip()
      if not raw:
          return None
@@ -30,5 +30,5 @@ index 4f9222597..07c509590 100644
          return None
  
 -- 
-2.54.0
+2.52.0
 

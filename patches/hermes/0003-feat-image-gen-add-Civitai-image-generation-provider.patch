@@ -726,5 +726,5 @@ index 7806db57e..cc2cb667e 100644
      except TypeError as exc:
          # A provider whose generate() signature predates image_url support
 -- 
-2.54.0
+2.52.0
 
