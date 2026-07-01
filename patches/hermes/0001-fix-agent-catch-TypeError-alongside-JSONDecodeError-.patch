@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:41 -0700
-Subject: [PATCH 01/19] fix(agent): catch TypeError alongside JSONDecodeError
+Subject: [PATCH 01/21] fix(agent): catch TypeError alongside JSONDecodeError
  in Keychain parsing
 
 The Keychain credential payload can arrive as a non-string type under

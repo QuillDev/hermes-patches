@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 12:05:56 -0700
-Subject: [PATCH 05/19] feat(model): allow provider-scoped model picker
+Subject: [PATCH 05/21] feat(model): allow provider-scoped model picker
  allowlist
 
 Add model_picker.allow so users can restrict picker visibility to exact provider/model pairs. The filter is provider-scoped, so gpt-5.5 can be shown only for openai-codex without also surfacing OpenAI API, Nous, or OpenRouter variants.

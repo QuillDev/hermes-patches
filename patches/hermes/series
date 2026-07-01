@@ -17,3 +17,5 @@
 0017-refactor-api-drop-unused-session-replay-endpoints.patch
 0018-fix-skip-Ollama-context-probe-for-OpenRouter.patch
 0019-fix-speed-up-interactive-CLI-startup.patch
+0020-feat-api-realtime-resumable-session-sync-engine.patch
+0021-refactor-api-remove-v1-runs-run_id-events-persist-ru.patch

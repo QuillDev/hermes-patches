@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 27 Jun 2026 13:18:26 -0700
-Subject: [PATCH 17/19] refactor(api): drop unused session replay endpoints
+Subject: [PATCH 17/21] refactor(api): drop unused session replay endpoints
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 

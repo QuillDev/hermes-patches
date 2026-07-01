@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:20:47 -0700
-Subject: [PATCH 03/19] feat(image-gen): add Civitai image generation provider
+Subject: [PATCH 03/21] feat(image-gen): add Civitai image generation provider
 
 Add a Civitai Orchestration API image generation backend for SDXL/Illustrious AIR checkpoints and LoRAs.
 
