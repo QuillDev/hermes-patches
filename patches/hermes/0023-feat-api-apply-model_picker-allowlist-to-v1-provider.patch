@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Wed, 1 Jul 2026 17:46:11 -0700
+Subject: [PATCH 23/23] feat(api): apply model_picker allowlist to
+ /v1/providers
+
+The external /v1/providers catalog called list_authenticated_providers
+directly and returned every authenticated provider, diverging from the
+curated hermes model / TUI picker which applies the model_picker.allow
+whitelist via inventory.build_models_payload. External UIs (the desktop
+model selector) are meant to mirror that picker, so apply the same
+load_model_picker_filter/apply_model_picker_filter pass here.
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index e6c0bb5f0..b29b22587 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -2126,6 +2126,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         def _load() -> tuple[str, str, list]:
+             from gateway.run import _load_gateway_config, _resolve_gateway_model, _resolve_runtime_agent_kwargs
+             from hermes_cli.config import get_compatible_custom_providers
++            from hermes_cli.inventory import apply_model_picker_filter, load_model_picker_filter
+             from hermes_cli.model_switch import list_authenticated_providers
+ 
+             try:
+@@ -2149,6 +2150,19 @@ class APIServerAdapter(BasePlatformAdapter):
+                 custom_providers=get_compatible_custom_providers(user_config),
+                 refresh=refresh,
+             )
++            # Honor the same ``model_picker.allow`` whitelist the TUI/``hermes
++            # model`` picker applies (see inventory.build_models_payload). Without
++            # this the external /v1/providers catalog exposed every authenticated
++            # provider, diverging from the curated CLI picker that external UIs
++            # (desktop model selector) are meant to mirror.
++            picker_filter = load_model_picker_filter()
++            if picker_filter is not None:
++                providers, _ = apply_model_picker_filter(
++                    providers,
++                    picker_filter,
++                    current_provider=current_provider,
++                    current_model=current_model,
++                )
+             return current_model, current_provider, providers
+ 
+         try:
+-- 
+2.52.0
+

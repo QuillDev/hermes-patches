@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quill <quill@example.com>
 Date: Sat, 27 Jun 2026 18:53:01 -0700
-Subject: [PATCH 19/21] fix: speed up interactive CLI startup
+Subject: [PATCH 19/23] fix: speed up interactive CLI startup
 
 Keep omitted --compact as None so HermesCLI can honor display.compact. Add display.startup_banner and display.startup_status toggles for users who want the fastest path to the prompt.
 
@@ -10,7 +10,7 @@ For bare interactive chat, defer plugin discovery, shell-hook registration, and 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/cli.py b/cli.py
-index e2069486f..8d3f756bd 100644
+index b5900da71..9039f6f41 100644
 --- a/cli.py
 +++ b/cli.py
 @@ -937,7 +937,7 @@ def _mark_tui_input_modes_active() -> None:
@@ -87,7 +87,7 @@ index e2069486f..8d3f756bd 100644
          if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
              tool_status = "tools deferred"
          else:
-@@ -12852,18 +12856,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12838,18 +12842,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              _detect_light_mode()
          except Exception:
              pass
@@ -118,7 +118,7 @@ index e2069486f..8d3f756bd 100644
          # Surface any active supply-chain security advisories right after the
          # welcome banner. Quiet/single-query paths call this themselves.
          self._show_security_advisories()
-@@ -12873,15 +12878,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12859,15 +12864,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
              if self._preload_resumed_session():
                  self._display_resumed_history()
  
@@ -145,7 +145,7 @@ index e2069486f..8d3f756bd 100644
  
          # Warm the /model picker's provider-models cache off-thread during this
          # idle window (banner shown, user about to type). The no-args picker
-@@ -12910,41 +12917,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+@@ -12896,41 +12903,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                  )
          except Exception:
              pass
@@ -221,7 +221,7 @@ index e2069486f..8d3f756bd 100644
  
          # Curator — kick off a background skill-maintenance pass on startup
          # if the schedule says we're due.  Runs in a daemon thread so it
-@@ -15453,7 +15462,7 @@ def main(
+@@ -15439,7 +15448,7 @@ def main(
      max_turns: int = None,
      verbose: Optional[bool] = None,
      quiet: bool = False,
@@ -230,7 +230,7 @@ index e2069486f..8d3f756bd 100644
      list_tools: bool = False,
      list_toolsets: bool = False,
      gateway: bool = False,
-@@ -15578,6 +15587,9 @@ def main(
+@@ -15564,6 +15573,9 @@ def main(
              _coding = None
          if _coding is not None:
              toolsets_list = _coding
@@ -240,7 +240,7 @@ index e2069486f..8d3f756bd 100644
          else:
              # Use the shared resolver so MCP servers are included at runtime
              from hermes_cli.tools_config import _get_platform_tools
-@@ -15600,6 +15612,14 @@ def main(
+@@ -15586,6 +15598,14 @@ def main(
          pass_session_id=pass_session_id,
          ignore_rules=ignore_rules,
      )
@@ -275,7 +275,7 @@ index a71d88356..69d4a64ed 100644
          self._ensure_tirith_security()
  
 diff --git a/hermes_cli/config.py b/hermes_cli/config.py
-index 17f506a5d..1a29960ed 100644
+index d98dd26d4..f20167ae4 100644
 --- a/hermes_cli/config.py
 +++ b/hermes_cli/config.py
 @@ -1639,6 +1639,12 @@ DEFAULT_CONFIG = {

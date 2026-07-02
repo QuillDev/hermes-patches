@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 11:21:00 -0700
-Subject: [PATCH 04/21] feat(api): durable session streams and REST API server
+Subject: [PATCH 04/23] feat(api): durable session streams and REST API server
  enhancements
 
 Add durable session event streaming, session run lifecycle tracking,
@@ -2627,7 +2627,7 @@ index ac1a12667..088bc5cdc 100644
                  conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                  removed_ids.append(sid)
 diff --git a/run_agent.py b/run_agent.py
-index 497197f76..19723ee92 100644
+index 9b6485d52..e2e01d1fd 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -1873,6 +1873,7 @@ class AIAgent:

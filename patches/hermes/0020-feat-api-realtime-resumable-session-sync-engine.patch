@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Wed, 1 Jul 2026 14:10:43 -0700
-Subject: [PATCH 20/21] feat(api): realtime resumable session sync engine
+Subject: [PATCH 20/23] feat(api): realtime resumable session sync engine
 
 Upgrade /api/sessions/{id}/subscribe from a 0.5s polling loop with
 split, client-managed cursors into a push-based, standards-resumable

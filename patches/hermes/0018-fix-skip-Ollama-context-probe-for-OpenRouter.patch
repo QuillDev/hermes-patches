@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quill Hermes Nix <nix@localhost>
 Date: Sat, 27 Jun 2026 18:34:50 -0700
-Subject: [PATCH 18/21] fix: skip Ollama context probe for OpenRouter
+Subject: [PATCH 18/23] fix: skip Ollama context probe for OpenRouter
 
 OpenRouter startup was paying a speculative /api/show request before reading its own model metadata. Scope that Ollama-native probe to Ollama providers; unknown custom endpoints still use the earlier provider-agnostic probe.
 

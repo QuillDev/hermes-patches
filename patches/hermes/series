@@ -19,3 +19,5 @@
 0019-fix-speed-up-interactive-CLI-startup.patch
 0020-feat-api-realtime-resumable-session-sync-engine.patch
 0021-refactor-api-remove-v1-runs-run_id-events-persist-ru.patch
+0022-feat-api-create-time-model-selection-and-v1-provider.patch
+0023-feat-api-apply-model_picker-allowlist-to-v1-provider.patch

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sun, 21 Jun 2026 01:25:00 -0700
-Subject: [PATCH 15/21] fix(streaming): don't emit content as
+Subject: [PATCH 15/23] fix(streaming): don't emit content as
  reasoning.available when structured reasoning exists
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
