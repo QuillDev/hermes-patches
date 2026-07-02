@@ -1,12 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 22:12:22 -0700
-Subject: [PATCH 11/23] fix(session): ignore empty compression children
+Subject: [PATCH 11/19] fix(session): ignore empty compression children
+
+Guard the compression-child edge so empty children (no messages and no
+API calls, e.g. rows created by api_server bootstrap) cannot hijack the
+compression tip, and broaden the ancestor edge used for title/metadata
+transfer so session bindings survive upstream sync.
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/hermes_state.py b/hermes_state.py
-index 088bc5cdc..74716f6fb 100644
+index 53c9beb46..642648c7d 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
 @@ -53,7 +53,9 @@ _BRANCH_CHILD_SQL = (
@@ -20,25 +25,45 @@ index 088bc5cdc..74716f6fb 100644
  )
  
  # Rows that surface in pickers: roots + branch children (subagent runs and
-@@ -2781,11 +2783,12 @@ class SessionDB:
-         The continuation edge is the canonical one shared with
-         :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
-         (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
+@@ -2760,20 +2762,14 @@ class SessionDB:
+         """Return True if *ancestor_id* is a compression predecessor of
+         *descendant_id* (walking parent links up the continuation chain).
+ 
+-        The continuation edge is the canonical one shared with
+-        :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
+-        (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
 -        parent ended with ``end_reason = 'compression'`` and the child started
 -        at or after the parent's ``ended_at``, which distinguishes continuations
 -        from delegate subagents / branch children that also carry a
 -        ``parent_session_id``. Expressed as a single recursive CTE rather than a
 -        per-hop Python walk so the edge definition lives in exactly one place.
-+        parent ended with ``end_reason = 'compression'``, the child started at
-+        or after the parent's ``ended_at``, and the child actually recorded
-+        work. The final guard keeps abandoned empty client/API rows from
-+        hijacking the projected live tip. Expressed as a single recursive CTE
-+        rather than a per-hop Python walk so the edge definition lives in
-+        exactly one place.
++        Title-transfer checks are intentionally broader than visible-tip
++        projection: test fixtures and older session rows may not have message or
++        API counts populated, but the parent-link still represents the same
++        compressed conversation. Keep branch/delegate/tool children excluded so
++        unrelated child sessions cannot steal a title from their parent.
          """
          if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
              return False
-@@ -2889,6 +2892,8 @@ class SessionDB:
+-        # Walk parent links up from the descendant, following only compression
+-        # continuation edges, and check whether ancestor_id is reached.
+-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+         row = conn.execute(
+             f"""
+             WITH RECURSIVE ancestors(id) AS (
+@@ -2783,7 +2779,10 @@ class SessionDB:
+                 FROM ancestors a
+                 JOIN sessions child ON child.id = a.id
+                 JOIN sessions parent ON parent.id = child.parent_session_id
+-                WHERE {edge}
++                WHERE parent.end_reason = 'compression'
++                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
++                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
++                  AND COALESCE(child.source, '') != 'tool'
+             )
+             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
+             """,
+@@ -2871,6 +2870,8 @@ class SessionDB:
                      JOIN sessions child ON child.id = a.id
                      JOIN sessions parent ON parent.id = child.parent_session_id
                      WHERE parent.end_reason = 'compression'
@@ -47,7 +72,7 @@ index 088bc5cdc..74716f6fb 100644
                    ),
                    descendants(id) AS (
                      SELECT ?
-@@ -2898,6 +2903,8 @@ class SessionDB:
+@@ -2880,6 +2881,8 @@ class SessionDB:
                      JOIN sessions parent ON parent.id = d.id
                      JOIN sessions child ON child.parent_session_id = parent.id
                      WHERE parent.end_reason = 'compression'
@@ -56,46 +81,19 @@ index 088bc5cdc..74716f6fb 100644
                    ),
                    lineage(id) AS (
                      SELECT id FROM ancestors
-@@ -2994,22 +3001,22 @@ class SessionDB:
-         """Walk the compression-continuation chain forward and return the tip.
- 
-         A compression continuation is a child of a session whose
--        ``end_reason = 'compression'``.  Older builds tried to distinguish
--        continuations from branches/subagents by requiring
--        ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
--        gateway + compression races can insert the real continuation row before
--        the parent row's ``ended_at`` is written, while a stale websocket later
--        creates/reuses a sibling that *does* satisfy the timestamp test.  The
--        visible symptom is brutal: desktop resume follows the stale sibling and
--        the user's latest messages look "lost" even though they are persisted in
--        the real continuation chain.
--
--        Instead, only follow children of compression-ended parents, exclude
--        explicit branch/delegate/tool children, and prefer children that are
--        themselves continuing the compression chain (``end_reason='compression'``)
--        or still live over stale closed siblings such as ``ws_orphan_reap``.
--        Returns the latest continuation tip, or the input id when no
--        continuation exists.
-+        ``end_reason = 'compression'`` and that recorded work (messages or API
-+        calls). Older builds tried to distinguish continuations from branches/
-+        subagents by requiring ``child.started_at >= parent.ended_at``. That
-+        ordering is too brittle: gateway + compression races can insert the real
-+        continuation row before the parent row's ``ended_at`` is written, while
-+        a stale websocket later creates/reuses a sibling that *does* satisfy the
-+        timestamp test. The work guard ignores abandoned empty rows created by
+@@ -2992,6 +2995,11 @@ class SessionDB:
+         or still live over stale closed siblings such as ``ws_orphan_reap``.
+         Returns the latest continuation tip, or the input id when no
+         continuation exists.
++
++        Additionally, only children that recorded work (messages or API calls)
++        are followed: the work guard ignores abandoned empty rows created by
 +        client/API resume attempts, which otherwise sort newest and make old
 +        conversations open as blank.
-+
-+        Instead, only follow non-empty children of compression-ended parents,
-+        exclude explicit branch/delegate/tool children, and prefer children that
-+        are themselves continuing the compression chain
-+        (``end_reason='compression'``) or still live over stale closed siblings
-+        such as ``ws_orphan_reap``. Returns the latest continuation tip, or the
-+        input id when no continuation exists.
          """
          current = session_id
          seen = {current} if current else set()
-@@ -3024,6 +3031,8 @@ class SessionDB:
+@@ -3006,6 +3014,8 @@ class SessionDB:
                      JOIN sessions child ON child.parent_session_id = parent.id
                      WHERE parent.id = ?
                        AND parent.end_reason = 'compression'
@@ -104,7 +102,7 @@ index 088bc5cdc..74716f6fb 100644
                        AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                        AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
                        AND COALESCE(child.source, '') != 'tool'
-@@ -3217,6 +3226,8 @@ class SessionDB:
+@@ -3199,6 +3209,8 @@ class SessionDB:
                      JOIN sessions parent ON parent.id = c.cur_id
                      JOIN sessions child ON child.parent_session_id = c.cur_id
                      WHERE parent.end_reason = 'compression'

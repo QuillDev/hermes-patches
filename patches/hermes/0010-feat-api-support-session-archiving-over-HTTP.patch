@@ -1,25 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 21:13:32 -0700
-Subject: [PATCH 10/23] feat(api): support session archiving over HTTP
+Subject: [PATCH 10/19] feat(api): support session archiving over HTTP
 
 Expose soft session archive state through the gateway API server so clients can archive, unarchive, and filter session lists without using the dashboard-only API.
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 4669d2b40..d8e8139d5 100644
+index bdbe65851..cd324205d 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1693,6 +1693,7 @@ class APIServerAdapter(BasePlatformAdapter):
-                 "session_run_replay": True,
-                 "session_subscribe_sse": True,
+@@ -1844,6 +1844,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 # reconnects resume via Last-Event-ID or ?resume=.
+                 "session_sync_resume": True,
                  "session_fork": True,
 +                "session_archiving": True,
                  "unified_session_create": True,
                  "workspace_resources": True,
                  "admin_config_rw": False,
-@@ -1845,9 +1846,11 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1994,9 +1995,11 @@ class APIServerAdapter(BasePlatformAdapter):
              "output_tokens", "cache_read_tokens", "cache_write_tokens",
              "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
              "api_call_count", "parent_session_id", "last_active", "preview", "cwd",
@@ -32,7 +32,7 @@ index 4669d2b40..d8e8139d5 100644
          metadata = _json_object(session.get("model_config"))
          worktree = metadata.get("nako_worktree") if isinstance(metadata.get("nako_worktree"), dict) else None
          if worktree:
-@@ -2436,12 +2439,28 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2502,12 +2505,28 @@ class APIServerAdapter(BasePlatformAdapter):
          offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
          source = request.query.get("source") or None
          include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
@@ -61,7 +61,7 @@ index 4669d2b40..d8e8139d5 100644
          )
          return web.json_response({
              "object": "list",
-@@ -2511,12 +2530,14 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2577,12 +2596,14 @@ class APIServerAdapter(BasePlatformAdapter):
          body, err = await self._read_json_body(request)
          if err:
              return err
@@ -77,7 +77,7 @@ index 4669d2b40..d8e8139d5 100644
          if "title" in body:
              try:
                  db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))
-@@ -2524,6 +2545,22 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2590,6 +2611,22 @@ class APIServerAdapter(BasePlatformAdapter):
                  return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
          if body.get("end_reason"):
              db.end_session(session_id, str(body["end_reason"]))
@@ -101,18 +101,18 @@ index 4669d2b40..d8e8139d5 100644
          return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
  
 diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
-index 11f08c47e..b92231ac6 100644
+index 8bd0b9991..a6945daeb 100644
 --- a/tests/gateway/test_session_api.py
 +++ b/tests/gateway/test_session_api.py
-@@ -103,6 +103,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
-     assert features["session_run_replay"] is True
+@@ -98,6 +98,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+     assert features["session_chat_streaming"] is True
      assert features["session_subscribe_sse"] is True
      assert features["session_fork"] is True
 +    assert features["session_archiving"] is True
      assert features["admin_config_rw"] is False
      assert features["memory_write_api"] is False
      assert features["skills_api"] is True
-@@ -224,6 +225,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
+@@ -211,6 +212,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
          assert patch_resp.status == 200
          patched = await patch_resp.json()
          assert patched["session"]["title"] == "Renamed"
@@ -120,7 +120,7 @@ index 11f08c47e..b92231ac6 100644
  
  
          delete_resp = await cli.delete(f"/api/sessions/{session_id}")
-@@ -233,6 +235,58 @@ async def test_session_crud_and_message_history(adapter, session_db):
+@@ -220,6 +222,58 @@ async def test_session_crud_and_message_history(adapter, session_db):
          assert session_db.get_session(session_id) is None
  
  

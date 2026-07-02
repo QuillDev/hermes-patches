@@ -1,10 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 23:52:21 -0700
-Subject: [PATCH 13/23] fix(session): preserve runtime metadata and archive
- state
+Subject: [PATCH 13/19] fix(session): preserve runtime metadata, archive state,
+ and cwd binding
 
-Persist safe runtime model/provider metadata on API-created sessions so future turns restore the actual Hermes runtime instead of the advertised API model id.
+Persist safe runtime model/provider metadata on API-created sessions so future turns restore the actual Hermes runtime instead of the advertised API model id, and thread the session cwd into the contextvar binding so the launch working directory survives upstream sync.
 
 Also keep desktop archived/deleted sessions hidden across stale refreshes and replace transient loading indicators with quieter session UI states.
 
@@ -240,41 +240,23 @@ index ff30931e3..4ad4346b4 100644
        <ConfirmDialog
          confirmLabel={copy.restoreConfirm}
 diff --git a/apps/desktop/src/components/assistant-ui/thread/status.tsx b/apps/desktop/src/components/assistant-ui/thread/status.tsx
-index 53c6f415a..19c7d8563 100644
+index 53c6f415a..6d9db4900 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/status.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/status.tsx
-@@ -5,7 +5,6 @@ import { type FC, type ReactNode, useEffect, useState } from 'react'
- import { useElapsedSeconds } from '@/components/chat/activity-timer'
- import { ActivityTimerText } from '@/components/chat/activity-timer-text'
- import { Codicon } from '@/components/ui/codicon'
--import { Loader } from '@/components/ui/loader'
- import { useI18n } from '@/i18n'
- import { cn } from '@/lib/utils'
- import { $backgroundResume } from '@/store/background-delegation'
-@@ -36,27 +35,65 @@ const CompactionHint: FC = () => (
-   <span className="shimmer min-w-0 truncate text-muted-foreground/55">{COMPACTION_LABEL}</span>
- )
+@@ -57,6 +57,65 @@ export const CenteredThreadSpinner: FC = () => {
+   )
+ }
  
--export const CenteredThreadSpinner: FC = () => {
 +export const ThreadLoadingSkeleton: FC = () => {
-   const { t } = useI18n()
- 
-   return (
-     <div
-       aria-label={t.assistant.thread.loadingSession}
--      className="pointer-events-none absolute inset-0 z-1 grid place-items-center"
++  const { t } = useI18n()
++
++  return (
++    <div
++      aria-label={t.assistant.thread.loadingSession}
 +      className="pointer-events-none absolute inset-0 z-1 overflow-hidden bg-(--ui-chat-surface-background)"
 +      data-slot="aui_thread-loading-skeleton"
-       role="status"
-     >
--      <Loader
--        aria-hidden="true"
--        className="size-12 text-midground/70"
--        pathSteps={220}
--        role="presentation"
--        strokeScale={0.72}
--        type="rose-curve"
--      />
++      role="status"
++    >
 +      <div className="mx-auto flex h-full w-full max-w-(--composer-width) min-w-0 flex-col gap-(--conversation-turn-gap) px-6 pt-[calc(var(--titlebar-height)+0.75rem)]">
 +        <SkeletonTurn align="end" widths={[44, 30]} />
 +        <SkeletonTurn widths={[68, 84, 58, 36]} />
@@ -283,10 +265,10 @@ index 53c6f415a..19c7d8563 100644
 +        <SkeletonTurn widths={[74, 62, 80, 42]} />
 +        <div aria-hidden="true" className="shrink-0" style={{ height: 'var(--thread-last-message-clearance)' }} />
 +      </div>
-     </div>
-   )
- }
- 
++    </div>
++  )
++}
++
 +const SkeletonTurn: FC<{ align?: 'start' | 'end'; widths: number[] }> = ({ align = 'start', widths }) => (
 +  <div
 +    aria-hidden="true"
@@ -448,10 +430,10 @@ index 2be408530..6983f0eb6 100644
  
    // Carry a known title onto a row that arrives title-less, so a freshly
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index ab5a80ece..8f3a3636f 100644
+index 36bf918fc..084c7d4d3 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -1444,7 +1444,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1593,7 +1593,7 @@ class APIServerAdapter(BasePlatformAdapter):
                  raise
              runtime_kwargs = {}
          reasoning_config = GatewayRunner._load_reasoning_config()
@@ -460,7 +442,7 @@ index ab5a80ece..8f3a3636f 100644
          if request_model_override:
              model = request_model_override.get("model") or model
              override_runtime = request_model_override.get("runtime") or {}
-@@ -1633,6 +1633,45 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1782,6 +1782,45 @@ class APIServerAdapter(BasePlatformAdapter):
                  runtime[key] = value
          return {"model": model, "provider": provider, "runtime": runtime}
  
@@ -506,7 +488,7 @@ index ab5a80ece..8f3a3636f 100644
      def _process_session_command(
          self,
          *,
-@@ -2139,20 +2178,28 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2288,20 +2327,28 @@ class APIServerAdapter(BasePlatformAdapter):
          session_id, err = self._new_client_session_id(body)
          if err is not None:
              return err
@@ -538,7 +520,7 @@ index ab5a80ece..8f3a3636f 100644
          return web.json_response(self._session_response(session), status=201)
  
      async def _create_unified_worktree_session(self, body: Dict[str, Any]) -> "web.Response":
-@@ -2184,7 +2231,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2333,7 +2380,7 @@ class APIServerAdapter(BasePlatformAdapter):
          except subprocess.CalledProcessError as exc:
              detail = (exc.stderr or exc.stdout or str(exc)).strip()
              return web.json_response(_openai_error(f"Failed to create worktree: {detail}", code="worktree_create_failed"), status=400)
@@ -547,7 +529,7 @@ index ab5a80ece..8f3a3636f 100644
              "nako_worktree": {
                  "workspace_id": workspace["id"],
                  "repo_path": workspace["repoPath"],
-@@ -2192,8 +2239,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2341,8 +2388,8 @@ class APIServerAdapter(BasePlatformAdapter):
                  "branch_name": branch_name,
                  "base_ref": base_ref,
              }
@@ -558,7 +540,7 @@ index ab5a80ece..8f3a3636f 100644
          system_prompt = body.get("system_prompt") or body.get("systemPrompt")
          if system_prompt is not None and not isinstance(system_prompt, str):
              return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
-@@ -2685,11 +2732,18 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2751,11 +2798,18 @@ class APIServerAdapter(BasePlatformAdapter):
          if db.get_session(session_id):
              return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
  
@@ -579,8 +561,24 @@ index ab5a80ece..8f3a3636f 100644
          title = body.get("title")
          if title is not None:
              try:
+@@ -5647,6 +5701,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         chat_id: str = "",
+         session_key: str = "",
+         session_id: str = "",
++        cwd: str = "",
+     ) -> list:
+         """Bind session contextvars for an API-server agent run.
+ 
+@@ -5670,6 +5725,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             chat_id=chat_id,
+             session_key=session_key,
+             session_id=session_id,
++            cwd=cwd,
+             async_delivery=False,
+         )
+ 
 diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
-index de85fb8c5..a4157c4ec 100644
+index 609f6b8bf..8ecac3a1b 100644
 --- a/tests/gateway/test_session_api.py
 +++ b/tests/gateway/test_session_api.py
 @@ -2,6 +2,7 @@
@@ -608,7 +606,7 @@ index de85fb8c5..a4157c4ec 100644
      app.router.add_get("/v1/sessions/active", adapter._handle_list_active_sessions)
      app.router.add_get("/v1/sessions/{session_id}/state", adapter._handle_session_state)
      app.router.add_get("/v1/sessions/{session_id}/items", adapter._handle_session_items)
-@@ -236,6 +238,97 @@ async def test_session_crud_and_message_history(adapter, session_db):
+@@ -223,6 +225,97 @@ async def test_session_crud_and_message_history(adapter, session_db):
          assert session_db.get_session(session_id) is None
  
  
@@ -706,7 +704,7 @@ index de85fb8c5..a4157c4ec 100644
  @pytest.mark.asyncio
  async def test_session_patch_archives_and_unarchives(adapter, session_db):
      session_id = session_db.create_session("archive-session", "api_server")
-@@ -459,12 +552,78 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
+@@ -446,12 +539,78 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
      assert kwargs["user_message"] == expected_user_message
  
  
@@ -785,7 +783,7 @@ index de85fb8c5..a4157c4ec 100644
  
      from hermes_cli.model_switch import ModelSwitchResult
  
-@@ -511,6 +670,15 @@ async def test_session_chat_process_commands_switches_model_without_agent_turn(
+@@ -498,6 +657,15 @@ async def test_session_chat_process_commands_switches_model_without_agent_turn(
      assert model_config["provider"] == "openrouter"
      assert model_config["base_url"] == "https://openrouter.ai/api/v1"
      assert "api_key" not in model_config

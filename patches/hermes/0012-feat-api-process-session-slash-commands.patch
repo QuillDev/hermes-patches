@@ -1,17 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 22:44:58 -0700
-Subject: [PATCH 12/23] feat(api): process session slash commands
+Subject: [PATCH 12/19] feat(api): process session slash commands
 
 Add opt-in command handling for API session chat routes so /model can update the session model without running an agent turn. Persist non-secret model runtime metadata for future turns and cover JSON and SSE paths.
 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index d8e8139d5..ab5a80ece 100644
+index cd324205d..36bf918fc 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -482,6 +482,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
+@@ -483,6 +483,34 @@ def _session_chat_queued_user_message(body: Dict[str, Any]) -> tuple[Any, Option
      return None, err
  
  
@@ -46,7 +46,7 @@ index d8e8139d5..ab5a80ece 100644
  def check_api_server_requirements() -> bool:
      """Check if API server dependencies are available."""
      return AIOHTTP_AVAILABLE
-@@ -1570,6 +1598,170 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1719,6 +1747,170 @@ class APIServerAdapter(BasePlatformAdapter):
                  status=400,
              )
  
@@ -217,7 +217,7 @@ index d8e8139d5..ab5a80ece 100644
      # ------------------------------------------------------------------
      # HTTP Handlers
      # ------------------------------------------------------------------
-@@ -2813,6 +3005,18 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2897,6 +3089,18 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -236,7 +236,7 @@ index d8e8139d5..ab5a80ece 100644
          history = self._conversation_history_for_session(session_id)
          result, usage = await self._run_agent(
              user_message=user_message,
-@@ -2861,6 +3065,39 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2945,6 +3149,39 @@ class APIServerAdapter(BasePlatformAdapter):
          request_model_override, model_override_err = self._resolve_request_model_override(body)
          if model_override_err is not None:
              return model_override_err
@@ -276,7 +276,7 @@ index d8e8139d5..ab5a80ece 100644
  
          loop = asyncio.get_running_loop()
          queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
-@@ -5427,6 +5664,8 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5514,6 +5751,8 @@ class APIServerAdapter(BasePlatformAdapter):
          another thread to stop in-progress LLM calls.
          """
          loop = asyncio.get_running_loop()
@@ -286,7 +286,7 @@ index d8e8139d5..ab5a80ece 100644
          def _run():
              from gateway.session_context import clear_session_vars
 diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
-index b92231ac6..de85fb8c5 100644
+index a6945daeb..609f6b8bf 100644
 --- a/tests/gateway/test_session_api.py
 +++ b/tests/gateway/test_session_api.py
 @@ -1,6 +1,7 @@
@@ -297,7 +297,7 @@ index b92231ac6..de85fb8c5 100644
  from unittest.mock import AsyncMock, patch
  
  import pytest
-@@ -458,6 +459,163 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
+@@ -445,6 +446,163 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
      assert kwargs["user_message"] == expected_user_message
  
  

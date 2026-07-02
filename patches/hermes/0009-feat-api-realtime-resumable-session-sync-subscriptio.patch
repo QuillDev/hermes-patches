@@ -1,15 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
-Date: Wed, 1 Jul 2026 14:10:43 -0700
-Subject: [PATCH 20/23] feat(api): realtime resumable session sync engine
+Date: Sat, 20 Jun 2026 20:51:55 -0700
+Subject: [PATCH 09/19] feat(api): realtime resumable session sync subscription
 
-Upgrade /api/sessions/{id}/subscribe from a 0.5s polling loop with
-split, client-managed cursors into a push-based, standards-resumable
-sync stream:
+Add /api/sessions/{id}/subscribe: an SSE endpoint that emits a snapshot,
+catch-up state, and replayable live run events for clients that drop
+into an existing API session, then keeps them current with a push-based,
+standards-resumable sync stream. Also expose lightweight live state on
+session list and detail responses so clients can show active work
+without N+1 calls.
 
 - SessionSyncNotifier: per-session wakeup fanout. Every in-process
-  event writer signals subscribers when it commits, so delivery no
-  longer waits on a poll timer. A 2s poll fallback remains for writers
+  event writer signals subscribers when it commits, so delivery does
+  not wait on a poll timer. A 2s poll fallback remains for writers
   in other processes sharing state.db.
 - hermes_state module-level session-event listener hook: the agent
   persists transcripts through its own SessionDB instance, so the
@@ -19,15 +22,15 @@ sync stream:
 - Composite resume cursor v1:<event_cursor>:<run_id>:<run_seq> carried
   as the SSE id: on every frame. Reconnects resume via the standard
   Last-Event-ID header (EventSource works with zero client
-  bookkeeping) or an explicit ?resume= param; the legacy
-  after/cursor/run_after/after_seq params keep working. Header beats
-  query params because EventSource re-sends the original stale query
-  string on auto-reconnect.
-- Startup recovery now appends a synthetic run.interrupted replay
-  event (at last_seq + 1) for runs orphaned by a server restart, so
-  resuming clients learn the run died instead of hanging; fresh
-  snapshots show status=interrupted. run.status events surface
-  status transitions that have no replayable event (e.g. /halt).
+  bookkeeping) or an explicit ?resume= param; after/cursor/run_after/
+  after_seq params are also supported. Header beats query params
+  because EventSource re-sends the original stale query string on
+  auto-reconnect.
+- Startup recovery appends a synthetic run.interrupted replay event
+  (at last_seq + 1) for runs orphaned by a server restart, so resuming
+  clients learn the run died instead of hanging; fresh snapshots show
+  status=interrupted. run.status events surface status transitions
+  that have no replayable event (e.g. /halt).
 - ResponseStore writes serialized behind a lock (agent callbacks write
   from executor threads onto a check_same_thread=False connection).
 - docs/api-session-sync.md documents the full protocol; capabilities
@@ -39,6 +42,7 @@ push-beats-poll latency, cross-thread/instance wakeups, restart
 interruption visibility, and join-in-progress/run.switch;
 TestSessionEventListeners covers the hermes_state hook.
 
+Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 diff --git a/docs/api-session-sync.md b/docs/api-session-sync.md
@@ -318,7 +322,7 @@ index 000000000..cb707e3ad
 +  tests/test_hermes_state.py -q -o addopts=
 +```
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
-index 4a5b4395a..084c7d4d3 100644
+index 739544f54..bdbe65851 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
 @@ -43,6 +43,7 @@ import re
@@ -329,7 +333,7 @@ index 4a5b4395a..084c7d4d3 100644
  import time
  import uuid
  from pathlib import Path
-@@ -529,6 +530,10 @@ class ResponseStore:
+@@ -501,6 +502,10 @@ class ResponseStore:
  
      def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
          self._max_size = max_size
@@ -340,7 +344,7 @@ index 4a5b4395a..084c7d4d3 100644
          if db_path is None:
              try:
                  from hermes_cli.config import get_hermes_home
-@@ -705,75 +710,106 @@ class ResponseStore:
+@@ -677,75 +682,106 @@ class ResponseStore:
              encoded_user_message = json.dumps(user_message, default=str)
          except (TypeError, ValueError):
              encoded_user_message = json.dumps(str(user_message))
@@ -420,21 +424,21 @@ index 4a5b4395a..084c7d4d3 100644
 -            (run_id, seq, event_name, json.dumps(stored_payload, default=str), now),
 -        )
 -        if status is None:
--            self._conn.execute(
+             self._conn.execute(
 -                "UPDATE session_runs SET updated_at = ?, last_seq = ? WHERE run_id = ?",
 -                (now, seq, run_id),
--            )
--        else:
-             self._conn.execute(
--                """UPDATE session_runs
--                   SET status = ?, error = COALESCE(?, error), updated_at = ?, last_seq = ?
--                   WHERE run_id = ?""",
--                (status, error, now, seq, run_id),
 +                """INSERT OR REPLACE INTO session_run_events
 +                   (run_id, seq, event_name, payload, created_at)
 +                   VALUES (?, ?, ?, ?, ?)""",
 +                (run_id, seq, event_name, json.dumps(stored_payload, default=str), now),
              )
+-        else:
+-            self._conn.execute(
+-                """UPDATE session_runs
+-                   SET status = ?, error = COALESCE(?, error), updated_at = ?, last_seq = ?
+-                   WHERE run_id = ?""",
+-                (status, error, now, seq, run_id),
+-            )
 -        self._conn.commit()
 +            if status is None:
 +                self._conn.execute(
@@ -505,7 +509,7 @@ index 4a5b4395a..084c7d4d3 100644
  
      def get_latest_session_run(self, session_id: str) -> Optional[Dict[str, Any]]:
          row = self._conn.execute(
-@@ -891,6 +927,100 @@ else:
+@@ -863,6 +899,100 @@ else:
      cors_middleware = None  # type: ignore[assignment]
  
  
@@ -606,7 +610,7 @@ index 4a5b4395a..084c7d4d3 100644
  def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
      """Redact API-bound error text before it crosses the HTTP boundary."""
      redacted = redact_sensitive_text(str(value), force=True)
-@@ -1092,6 +1222,12 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1064,6 +1194,12 @@ class APIServerAdapter(BasePlatformAdapter):
      # ``async_delivery_supported()``.
      supports_async_delivery: bool = False
  
@@ -619,7 +623,7 @@ index 4a5b4395a..084c7d4d3 100644
      def __init__(self, config: PlatformConfig):
          super().__init__(config, Platform.API_SERVER)
          extra = config.extra or {}
-@@ -1111,6 +1247,9 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1083,6 +1219,9 @@ class APIServerAdapter(BasePlatformAdapter):
          self._runner: Optional["web.AppRunner"] = None
          self._site: Optional["web.TCPSite"] = None
          self._response_store = ResponseStore()
@@ -629,7 +633,7 @@ index 4a5b4395a..084c7d4d3 100644
          # Active run streams: run_id -> asyncio.Queue of SSE event dicts
          self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
          # Creation timestamps for orphaned-run TTL sweep
-@@ -1395,6 +1534,16 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1367,6 +1506,16 @@ class APIServerAdapter(BasePlatformAdapter):
                  self._session_db = SessionDB()
              except Exception as e:
                  logger.debug("SessionDB unavailable for API server: %s", e)
@@ -646,26 +650,105 @@ index 4a5b4395a..084c7d4d3 100644
          return self._session_db
  
      # ------------------------------------------------------------------
-@@ -1922,6 +2071,9 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -1690,6 +1839,10 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_resources": True,
                  "session_chat": True,
                  "session_chat_streaming": True,
-                 "session_subscribe_sse": True,
++                "session_subscribe_sse": True,
 +                # /subscribe frames carry a composite cursor as the SSE id;
 +                # reconnects resume via Last-Event-ID or ?resume=.
 +                "session_sync_resume": True,
                  "session_fork": True,
-                 "session_archiving": True,
                  "unified_session_create": True,
-@@ -2817,12 +2969,48 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "workspace_resources": True,
+@@ -1724,6 +1877,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
+                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
+                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
++                "session_subscribe": {"method": "GET", "path": "/api/sessions/{session_id}/subscribe"},
+                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+@@ -2112,6 +2266,42 @@ class APIServerAdapter(BasePlatformAdapter):
+             payload["active"] = True
+         return payload
  
-         resolved_id = db.resolve_resume_session_id(session_id)
-         resolved_session = db.get_session(resolved_id) or session
--        explicit_cursor = request.query.get("after") or request.query.get("cursor")
--        session_cursor = explicit_cursor or db.latest_session_event_cursor(resolved_id) or "0"
--        try:
--            run_after = int(request.query.get("run_after") or request.query.get("after_seq") or "0")
--        except ValueError:
--            return web.json_response(_openai_error("run_after must be an integer", code="invalid_run_after"), status=400)
++    def _session_response_with_activity(self, session: Dict[str, Any]) -> Dict[str, Any]:
++        """Return session metadata plus lightweight live-run state for clients."""
++        payload = self._session_response(session)
++        session_id = str(session.get("id") or payload.get("id") or "")
++        db = self._ensure_session_db()
++        stored_state = None
++        latest_event_cursor = None
++        if db is not None and session_id:
++            try:
++                stored_state = db.get_session_sync_state(session_id)
++                latest_event_cursor = db.latest_session_event_cursor(session_id)
++            except Exception:
++                stored_state = session.get("sync_state") if isinstance(session.get("sync_state"), dict) else None
++        else:
++            stored_state = session.get("sync_state") if isinstance(session.get("sync_state"), dict) else None
++        sync_state = self._live_session_state(session_id, stored_state)
++        latest_run = self._response_store.get_latest_session_run(session_id) if session_id else None
++        run_is_active = bool(
++            latest_run
++            and latest_run.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
++        )
++        if run_is_active:
++            sync_state["state"] = "processing"
++            sync_state["status"] = "processing"
++            sync_state["active"] = True
++            payload["active_run"] = latest_run
++        else:
++            payload["active_run"] = None
++            if sync_state.get("state") == "idle":
++                sync_state["active"] = False
++        payload["sync_state"] = sync_state
++        payload["active"] = bool(run_is_active or sync_state.get("state") == "processing")
++        payload["status"] = str(sync_state.get("status") or sync_state.get("state") or "idle")
++        payload["latest_event_cursor"] = latest_event_cursor
++        return payload
++
+     def _record_response_session_event(
+         self,
+         *,
+@@ -2321,7 +2511,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         )
+         return web.json_response({
+             "object": "list",
+-            "data": [self._session_response(s) for s in sessions],
++            "data": [self._session_response_with_activity(s) for s in sessions],
+             "limit": limit,
+             "offset": offset,
+             "has_more": len(sessions) == limit,
+@@ -2373,7 +2563,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         session, err = self._get_existing_session_or_404(request.match_info["session_id"])
+         if err:
+             return err
+-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
++        return web.json_response({"object": "hermes.session", "session": self._session_response_with_activity(session)})
+ 
+     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
+         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
+@@ -2481,6 +2671,171 @@ class APIServerAdapter(BasePlatformAdapter):
+         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
+         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+ 
++    async def _handle_session_subscribe(self, request: "web.Request") -> "web.StreamResponse":
++        """GET /api/sessions/{session_id}/subscribe — snapshot + live SSE."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        session_id = request.match_info["session_id"]
++        session, err = self._get_existing_session_or_404(session_id)
++        if err:
++            return err
++        db = self._ensure_session_db()
++        if db is None:
++            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
++
++        resolved_id = db.resolve_resume_session_id(session_id)
++        resolved_session = db.get_session(resolved_id) or session
 +
 +        # Resume-cursor precedence: Last-Event-ID header, then an explicit
 +        # composite resume token, then the legacy split params. The header
@@ -708,13 +791,21 @@ index 4a5b4395a..084c7d4d3 100644
 +                        )
 +        if not session_cursor:
 +            session_cursor = db.latest_session_event_cursor(resolved_id) or "0"
-         once = _coerce_request_bool(request.query.get("once"), default=False)
- 
-         headers = {
-@@ -2838,11 +3026,27 @@ class APIServerAdapter(BasePlatformAdapter):
-         response = web.StreamResponse(status=200, headers=headers)
-         await response.prepare(request)
- 
++        once = _coerce_request_bool(request.query.get("once"), default=False)
++
++        headers = {
++            "Content-Type": "text/event-stream",
++            "Cache-Control": "no-cache",
++            "X-Accel-Buffering": "no",
++            "X-Hermes-Session-Id": resolved_id,
++        }
++        origin = request.headers.get("Origin", "")
++        cors = self._cors_headers_for_origin(origin) if origin else None
++        if cors:
++            headers.update(cors)
++        response = web.StreamResponse(status=200, headers=headers)
++        await response.prepare(request)
++
 +        latest_run = self._response_store.get_latest_session_run(resolved_id)
 +        active_run_id = latest_run.get("run_id") if latest_run else None
 +        active_run_status = latest_run.get("status") if latest_run else None
@@ -725,61 +816,58 @@ index 4a5b4395a..084c7d4d3 100644
 +        else:
 +            active_run_seq = run_after
 +
-         async def _write_event(event_name: str, payload: Dict[str, Any]) -> None:
++        async def _write_event(event_name: str, payload: Dict[str, Any]) -> None:
 +            # Every frame carries the composite resume token as its SSE id so
 +            # EventSource reconnects (Last-Event-ID) resume without client
 +            # bookkeeping. Cursors are advanced BEFORE the write, so the id
 +            # always means "everything up to and including this frame".
 +            token = _encode_sync_cursor(session_cursor, active_run_id, active_run_seq)
-             data = json.dumps(payload, ensure_ascii=False)
--            await response.write(f"event: {event_name}\ndata: {data}\n\n".encode("utf-8"))
++            data = json.dumps(payload, ensure_ascii=False)
 +            await response.write(
 +                f"id: {token}\nevent: {event_name}\ndata: {data}\n\n".encode("utf-8")
 +            )
- 
--        latest_run = self._response_store.get_latest_session_run(resolved_id)
-         snapshot = {
-             "object": "hermes.session.snapshot",
-             "session_id": resolved_id,
-@@ -2851,25 +3055,31 @@ class APIServerAdapter(BasePlatformAdapter):
-             "items": db.get_session_items(resolved_id),
-             "latest_event_cursor": db.latest_session_event_cursor(resolved_id),
-             "active_run": latest_run,
++
++        snapshot = {
++            "object": "hermes.session.snapshot",
++            "session_id": resolved_id,
++            "session": self._session_response(resolved_session),
++            "messages": [self._message_response(m) for m in db.get_messages(resolved_id)],
++            "items": db.get_session_items(resolved_id),
++            "latest_event_cursor": db.latest_session_event_cursor(resolved_id),
++            "active_run": latest_run,
 +            "cursor": _encode_sync_cursor(session_cursor, active_run_id, active_run_seq),
-         }
--        active_run_id = latest_run.get("run_id") if latest_run else None
--        active_run_seq = run_after
-         last_activity = time.monotonic()
- 
++        }
++        last_activity = time.monotonic()
++
 +        waiter = self._sync_notifier.attach(resolved_id)
-         try:
-             await _write_event("session.snapshot", snapshot)
-             while True:
++        try:
++            await _write_event("session.snapshot", snapshot)
++            while True:
 +                # Clear before reading: a write landing during the reads
 +                # re-sets the flag and the next wait returns immediately, so
 +                # no event can slip between "drained stores" and "went to sleep".
 +                waiter.clear()
-                 wrote = False
-                 for event in db.list_session_events(session_id=resolved_id, after=session_cursor, limit=100):
--                    await _write_event(str(event.get("event_type") or "session.event"), event)
-                     session_cursor = event.get("cursor") or session_cursor
++                wrote = False
++                for event in db.list_session_events(session_id=resolved_id, after=session_cursor, limit=100):
++                    session_cursor = event.get("cursor") or session_cursor
 +                    await _write_event(str(event.get("event_type") or "session.event"), event)
-                     wrote = True
- 
-                 latest_run = self._response_store.get_latest_session_run(resolved_id)
-                 latest_run_id = latest_run.get("run_id") if latest_run else None
++                    wrote = True
++
++                latest_run = self._response_store.get_latest_session_run(resolved_id)
++                latest_run_id = latest_run.get("run_id") if latest_run else None
 +                latest_run_status = latest_run.get("status") if latest_run else None
-                 if latest_run_id and latest_run_id != active_run_id:
-                     active_run_id = latest_run_id
-                     active_run_seq = 0
++                if latest_run_id and latest_run_id != active_run_id:
++                    active_run_id = latest_run_id
++                    active_run_seq = 0
 +                    active_run_status = latest_run_status
-                     await _write_event("run.switch", {"session_id": resolved_id, "run": latest_run})
-                     wrote = True
-                 if active_run_id:
-@@ -2878,6 +3088,13 @@ class APIServerAdapter(BasePlatformAdapter):
-                         active_run_seq = max(active_run_seq, int(payload.get("seq") or active_run_seq))
-                         await _write_event(str(item.get("event") or "run.event"), payload)
-                         wrote = True
++                    await _write_event("run.switch", {"session_id": resolved_id, "run": latest_run})
++                    wrote = True
++                if active_run_id:
++                    for item in self._response_store.list_session_run_events(active_run_id, after=active_run_seq):
++                        payload = item.get("payload") or {}
++                        active_run_seq = max(active_run_seq, int(payload.get("seq") or active_run_seq))
++                        await _write_event(str(item.get("event") or "run.event"), payload)
++                        wrote = True
 +                    if latest_run_id == active_run_id and latest_run_status != active_run_status:
 +                        # Status changed without a replayable event (e.g.
 +                        # /halt) — surface the transition so clients don't
@@ -787,14 +875,14 @@ index 4a5b4395a..084c7d4d3 100644
 +                        active_run_status = latest_run_status
 +                        await _write_event("run.status", {"session_id": resolved_id, "run": latest_run})
 +                        wrote = True
- 
-                 if once:
-                     break
-@@ -2886,11 +3103,20 @@ class APIServerAdapter(BasePlatformAdapter):
-                 elif time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
-                     await response.write(b": keepalive\n\n")
-                     last_activity = time.monotonic()
--                await asyncio.sleep(0.5)
++
++                if once:
++                    break
++                if wrote:
++                    last_activity = time.monotonic()
++                elif time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
++                    await response.write(b": keepalive\n\n")
++                    last_activity = time.monotonic()
 +                try:
 +                    # Push-first: writers signal the notifier on every durable
 +                    # append. The timeout is only a fallback for writers in
@@ -803,16 +891,18 @@ index 4a5b4395a..084c7d4d3 100644
 +                    await asyncio.wait_for(waiter.wait(), timeout=self._SUBSCRIBE_POLL_INTERVAL)
 +                except asyncio.TimeoutError:
 +                    pass
-         except (asyncio.CancelledError, ConnectionResetError):
-             raise
-         except Exception as exc:
-             logger.debug("[api_server] session subscribe stream error for %s: %s", resolved_id, exc)
++        except (asyncio.CancelledError, ConnectionResetError):
++            raise
++        except Exception as exc:
++            logger.debug("[api_server] session subscribe stream error for %s: %s", resolved_id, exc)
 +        finally:
 +            self._sync_notifier.detach(resolved_id, waiter)
-         return response
- 
++        return response
++
      async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
-@@ -3017,6 +3243,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+         auth_err = self._check_auth(request)
+@@ -2560,6 +2915,7 @@ class APIServerAdapter(BasePlatformAdapter):
          run_id = f"run_{uuid.uuid4().hex}"
          agent_ref = [None]
          self._response_store.create_session_run(run_id, session_id, user_message)
@@ -820,7 +910,7 @@ index 4a5b4395a..084c7d4d3 100644
  
          def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
              payload.setdefault("session_id", session_id)
-@@ -3024,6 +3251,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2567,6 +2923,7 @@ class APIServerAdapter(BasePlatformAdapter):
              payload.setdefault("ts", time.time())
              try:
                  payload = self._response_store.put_session_run_event(run_id, name, payload)
@@ -828,7 +918,7 @@ index 4a5b4395a..084c7d4d3 100644
              except Exception:
                  logger.debug("[api_server] failed to persist session run event", exc_info=True)
              return name, payload
-@@ -3135,6 +3363,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -2678,6 +3035,7 @@ class APIServerAdapter(BasePlatformAdapter):
                      run_id = str(queued.get("run_id") or f"run_{uuid.uuid4().hex}")
                      message_id = f"msg_{uuid.uuid4().hex}"
                      self._response_store.create_session_run(run_id, session_id, queued.get("user_message"))
@@ -836,7 +926,7 @@ index 4a5b4395a..084c7d4d3 100644
                      await _run_turn(
                          queued.get("user_message"),
                          queued.get("system_prompt"),
-@@ -6448,6 +6677,7 @@ class APIServerAdapter(BasePlatformAdapter):
+@@ -5987,6 +6345,7 @@ class APIServerAdapter(BasePlatformAdapter):
              return False
  
          try:
@@ -844,11 +934,19 @@ index 4a5b4395a..084c7d4d3 100644
              mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
              self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
              assert self._app is not None
+@@ -6010,6 +6369,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
+             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
++            self._app.router.add_get("/api/sessions/{session_id}/subscribe", self._handle_session_subscribe)
+             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
+             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
 diff --git a/hermes_state.py b/hermes_state.py
-index 3d83c0f94..13445c660 100644
+index 238e5b51b..53c9beb46 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -169,6 +169,37 @@ _last_init_error_lock = threading.Lock()
+@@ -167,6 +167,37 @@ _last_init_error_lock = threading.Lock()
  _wal_fallback_warned_paths: set[str] = set()
  _wal_fallback_warned_lock = threading.Lock()
  
@@ -886,7 +984,7 @@ index 3d83c0f94..13445c660 100644
  _FTS_TRIGGERS = (
      "messages_fts_insert",
      "messages_fts_delete",
-@@ -1443,6 +1474,7 @@ class SessionDB:
+@@ -1441,6 +1472,7 @@ class SessionDB:
              )
  
          event_row_id = self._execute_write(_do)
@@ -894,7 +992,7 @@ index 3d83c0f94..13445c660 100644
          events = self.list_session_events(after=event_row_id - 1, limit=1)
          return events[0]
  
-@@ -2077,6 +2109,7 @@ class SessionDB:
+@@ -2075,6 +2107,7 @@ class SessionDB:
                      created_at=ended_at,
                  )
          self._execute_write(_do)
@@ -902,7 +1000,7 @@ index 3d83c0f94..13445c660 100644
  
      def reopen_session(self, session_id: str) -> None:
          """Clear ended_at/end_reason so a session can be resumed."""
-@@ -2092,6 +2125,7 @@ class SessionDB:
+@@ -2090,6 +2123,7 @@ class SessionDB:
                  payload={"session_id": session_id, "state": "idle"},
              )
          self._execute_write(_do)
@@ -910,7 +1008,7 @@ index 3d83c0f94..13445c660 100644
  
      def update_session_cwd(
          self, session_id: str, cwd: str, git_branch: str = None, git_repo_root: str = None
-@@ -3564,7 +3598,9 @@ class SessionDB:
+@@ -3557,7 +3591,9 @@ class SessionDB:
                  )
              return msg_id
  
@@ -921,7 +1019,7 @@ index 3d83c0f94..13445c660 100644
  
      def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
          """Insert *messages* as fresh active rows for *session_id*.
-@@ -3728,6 +3764,7 @@ class SessionDB:
+@@ -3721,6 +3757,7 @@ class SessionDB:
              )
  
          self._execute_write(_do)
@@ -929,7 +1027,7 @@ index 3d83c0f94..13445c660 100644
  
      def has_archived_messages(self, session_id: str) -> bool:
          """Return True if the session has any soft-archived (``active = 0``) rows.
-@@ -3793,7 +3830,9 @@ class SessionDB:
+@@ -3786,7 +3823,9 @@ class SessionDB:
              )
              return inserted
  
@@ -941,21 +1039,181 @@ index 3d83c0f94..13445c660 100644
  
      def get_messages(
 diff --git a/tests/gateway/test_session_api.py b/tests/gateway/test_session_api.py
-index 203204654..8ecac3a1b 100644
+index 1e746ccb6..8bd0b9991 100644
 --- a/tests/gateway/test_session_api.py
 +++ b/tests/gateway/test_session_api.py
-@@ -1154,6 +1154,10 @@ async def test_session_subscribe_streams_events_written_after_connect(adapter, s
-             "run.completed",
-             {"message_id": "msg_live", "completed": True},
-         )
+@@ -61,6 +61,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
+     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
+     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
+     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
++    app.router.add_get("/api/sessions/{session_id}/subscribe", adapter._handle_session_subscribe)
+     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+@@ -95,6 +96,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+     assert features["session_resources"] is True
+     assert features["session_chat"] is True
+     assert features["session_chat_streaming"] is True
++    assert features["session_subscribe_sse"] is True
+     assert features["session_fork"] is True
+     assert features["admin_config_rw"] is False
+     assert features["memory_write_api"] is False
+@@ -105,6 +107,10 @@ async def test_capabilities_advertises_session_control_surface(adapter):
+         "method": "POST",
+         "path": "/api/sessions/{session_id}/chat/stream",
+     }
++    assert data["endpoints"]["session_subscribe"] == {
++        "method": "GET",
++        "path": "/api/sessions/{session_id}/subscribe",
++    }
+ 
+ 
+ @pytest.mark.asyncio
+@@ -183,6 +189,9 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert listed["object"] == "list"
+         assert [s["id"] for s in listed["data"]] == [session_id]
+         assert listed["data"][0]["message_count"] == 2
++        assert listed["data"][0]["active"] is False
++        assert listed["data"][0]["status"] == "idle"
++        assert listed["data"][0]["active_run"] is None
+ 
+         get_resp = await cli.get(f"/api/sessions/{session_id}")
+         assert get_resp.status == 200
+@@ -203,6 +212,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         patched = await patch_resp.json()
+         assert patched["session"]["title"] == "Renamed"
+ 
++
+         delete_resp = await cli.delete(f"/api/sessions/{session_id}")
+         assert delete_resp.status == 200
+         deleted = await delete_resp.json()
+@@ -210,6 +220,32 @@ async def test_session_crud_and_message_history(adapter, session_db):
+         assert session_db.get_session(session_id) is None
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_list_and_get_include_active_run_state(adapter, session_db):
++    session_id = session_db.create_session("active-list-session", "api_server")
++    adapter._response_store.create_session_run("run_active_list", session_id, "still working")
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        list_resp = await cli.get("/api/sessions?limit=10&offset=0")
++        assert list_resp.status == 200
++        listed = await list_resp.json()
++        item = listed["data"][0]
++
++        get_resp = await cli.get(f"/api/sessions/{session_id}")
++        assert get_resp.status == 200
++        got = await get_resp.json()
++
++    for payload in (item, got["session"]):
++        assert payload["id"] == session_id
++        assert payload["active"] is True
++        assert payload["status"] == "processing"
++        assert payload["sync_state"]["active"] is True
++        assert payload["sync_state"]["state"] == "processing"
++        assert payload["active_run"]["run_id"] == "run_active_list"
++        assert payload["active_run"]["status"] == "queued"
++
++
+ @pytest.mark.asyncio
+ async def test_session_messages_follow_compression_tip(adapter, session_db):
+     source_id = session_db.create_session("source-session", "api_server")
+@@ -671,6 +707,92 @@ async def test_session_chat_stream_persists_replayable_run_state(adapter, sessio
+     assert run_id in body
+ 
+ 
++@pytest.mark.asyncio
++async def test_session_subscribe_sends_snapshot_and_replays_active_run(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("subscribe-session", "api_server")
++    session_db.append_message(session_id, "user", "existing prompt")
++    session_db.append_message(session_id, "assistant", "existing answer")
++    adapter._response_store.create_session_run("run_subscribe", session_id, "live prompt")
++    adapter._response_store.put_session_run_event("run_subscribe", "run.started", {"status": "running"})
++    adapter._response_store.put_session_run_event(
++        "run_subscribe",
++        "assistant.delta",
++        {"message_id": "msg_live", "delta": "live delta"},
++    )
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.get(f"/api/sessions/{session_id}/subscribe?once=true")
++        assert resp.status == 200
++        body = await resp.text()
++
++    events = []
++    for block in body.split("\n\n"):
++        if not block.strip() or block.startswith(":"):
++            continue
++        event_name = None
++        data = None
++        for line in block.splitlines():
++            if line.startswith("event: "):
++                event_name = line[len("event: "):]
++            elif line.startswith("data: "):
++                data = _json.loads(line[len("data: "):])
++        if event_name and data is not None:
++            events.append((event_name, data))
++
++    assert events[0][0] == "session.snapshot"
++    snapshot = events[0][1]
++    assert snapshot["session"]["id"] == session_id
++    assert [m["content"] for m in snapshot["messages"]] == ["existing prompt", "existing answer"]
++    assert snapshot["active_run"]["run_id"] == "run_subscribe"
++    assert [name for name, _ in events][1:] == ["run.started", "assistant.delta"]
++    assert events[-1][1]["delta"] == "live delta"
++
++
++@pytest.mark.asyncio
++async def test_session_subscribe_streams_events_written_after_connect(adapter, session_db):
++    import json as _json
++
++    session_id = session_db.create_session("subscribe-live-session", "api_server")
++    adapter._response_store.create_session_run("run_live_subscribe", session_id, "live prompt")
++    adapter._response_store.put_session_run_event("run_live_subscribe", "run.started", {"status": "running"})
++
++    app = _create_session_app(adapter)
++    async with TestClient(TestServer(app)) as cli:
++        resp = await cli.get(f"/api/sessions/{session_id}/subscribe")
++        assert resp.status == 200
++
++        adapter._response_store.put_session_run_event(
++            "run_live_subscribe",
++            "assistant.delta",
++            {"message_id": "msg_live", "delta": "arrived after subscribe"},
++        )
++        adapter._response_store.put_session_run_event(
++            "run_live_subscribe",
++            "run.completed",
++            {"message_id": "msg_live", "completed": True},
++        )
 +        # Real writers signal the notifier after persisting (see
 +        # _event_payload); emulate that so the subscriber wakes via push
 +        # instead of waiting out the poll-fallback interval.
 +        adapter._sync_notifier.notify(session_id)
- 
-         seen_delta = None
-         for _ in range(160):
-@@ -1183,7 +1187,14 @@ def test_response_store_marks_incomplete_session_runs_interrupted_after_restart(
++
++        seen_delta = None
++        for _ in range(160):
++            line = await asyncio.wait_for(resp.content.readline(), timeout=2)
++            if not line:
++                break
++            if line.startswith(b"data: "):
++                payload = _json.loads(line[len(b"data: "):])
++                if payload.get("delta") == "arrived after subscribe":
++                    seen_delta = payload
++                    break
++
++    assert seen_delta is not None
++
++
+ def test_response_store_marks_incomplete_session_runs_interrupted_after_restart(tmp_path):
+     db_path = tmp_path / "response_store.db"
+     store = ResponseStore(db_path=str(db_path))
+@@ -685,7 +807,14 @@ def test_response_store_marks_incomplete_session_runs_interrupted_after_restart(
          assert run["status"] == "interrupted"
          assert "restarted" in run["error"]
          events = restarted_store.list_session_run_events("run_pending")

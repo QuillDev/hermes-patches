@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: robert-brunson-fragile <siinspam@gmail.com>
 Date: Sat, 20 Jun 2026 12:05:56 -0700
-Subject: [PATCH 05/23] feat(model): allow provider-scoped model picker
+Subject: [PATCH 05/19] feat(model): allow provider-scoped model picker
  allowlist
 
 Add model_picker.allow so users can restrict picker visibility to exact provider/model pairs. The filter is provider-scoped, so gpt-5.5 can be shown only for openai-codex without also surfacing OpenAI API, Nous, or OpenRouter variants.
@@ -11,7 +11,7 @@ The policy is picker-only: explicit /model switches remain available for power u
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
-index 0914cfc03..d30fde94f 100644
+index 0914cfc03..0dc80b0b2 100644
 --- a/hermes_cli/inventory.py
 +++ b/hermes_cli/inventory.py
 @@ -76,6 +76,17 @@ class ConfigContext:
@@ -157,16 +157,10 @@ index 0914cfc03..d30fde94f 100644
  # ─── Public: payload builder ────────────────────────────────────────────
  
  
-@@ -213,7 +342,22 @@ def build_models_payload(
-                     row["total_models"] = len(filtered)
+@@ -214,6 +343,17 @@ def build_models_payload(
  
      if include_unconfigured:
--        rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
-+        rows = list(rows) + [
-+            r
-+            for r in _append_unconfigured_rows(rows, ctx)
-+            if str(r.get("slug", "")).lower() != "moa"
-+        ]
+         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
 +
 +    filter_meta = None
 +    picker_filter = load_model_picker_filter()
@@ -181,7 +175,7 @@ index 0914cfc03..d30fde94f 100644
      if picker_hints:
          _apply_picker_hints(rows)
      if canonical_order:
-@@ -223,11 +367,14 @@ def build_models_payload(
+@@ -223,11 +363,14 @@ def build_models_payload(
      if capabilities:
          _apply_capabilities(rows)
  

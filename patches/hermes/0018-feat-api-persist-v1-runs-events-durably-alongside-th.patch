@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: robert-brunson-fragile <siinspam@gmail.com>
+Date: Wed, 1 Jul 2026 14:20:04 -0700
+Subject: [PATCH 18/19] feat(api): persist /v1/runs events durably alongside
+ the SSE stream
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The upstream /v1/runs/{run_id}/events SSE stream is single-consumer and
+ephemeral: the queue is popped on first detach and events emitted after
+that are dropped. Keep the endpoint exactly as upstream ships it, and
+additionally persist every run lifecycle event so any number of clients
+can observe or replay runs through the durable session sync surface.
+
+- POST /v1/runs registers the run in ResponseStore (create_session_run)
+  and every event that feeds the per-run queue — message.delta, tool.*,
+  reasoning.available, approval.request/responded,
+  run.started/completed/failed/cancelled — is also persisted via a new
+  _emit_run_event helper (put_session_run_event + subscriber notify) and
+  observed via GET /api/sessions/{id}/subscribe. The 202 response now
+  includes session_id so clients know what to subscribe to.
+- Approval flow gains a polling path: approval.request is stashed as
+  pending_approval in the run status (GET /v1/runs/{id} shows
+  status=waiting_for_approval plus the redacted request) and cleared on
+  response. _set_run_status now removes fields passed as None.
+- Orphan sweep fix: only reap runs whose task is gone or done.
+  Previously a long (>300s) run with no attached SSE consumer had its
+  stop/approval bookkeeping dropped mid-flight by the TTL sweep.
+
+Tests: durable lifecycle persistence, stop reaching a terminal durable
+state, and approval status polling + durable replay added alongside the
+existing SSE stream tests (all upstream tests kept).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 084c7d4d3..f4d211618 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -5933,7 +5933,11 @@ class APIServerAdapter(BasePlatformAdapter):
+     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+ 
+     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+-        """Update pollable run status without exposing private agent objects."""
++        """Update pollable run status without exposing private agent objects.
++
++        Passing ``field=None`` removes the field from the status (used to
++        clear ``pending_approval`` once the approval is resolved).
++        """
+         now = time.time()
+         current = self._run_statuses.get(run_id, {})
+         current.update({
+@@ -5943,11 +5947,38 @@ class APIServerAdapter(BasePlatformAdapter):
+             "updated_at": now,
+         })
+         current.setdefault("created_at", fields.pop("created_at", now))
+-        current.update(fields)
++        for key, value in fields.items():
++            if value is None:
++                current.pop(key, None)
++            else:
++                current[key] = value
+         self._run_statuses[run_id] = current
+         return current
+ 
+-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
++    def _emit_run_event(
++        self, run_id: str, session_id: Optional[str], name: str, payload: Dict[str, Any]
++    ) -> None:
++        """Durably persist a /v1/runs event and wake session subscribers.
++
++        Complements the in-memory per-run SSE queue: events also land in
++        ResponseStore.session_run_events, so any number of clients can observe
++        or replay them through /api/sessions/{id}/subscribe. Safe to call from
++        executor threads (both the store write and notify are thread-safe).
++        """
++        payload = dict(payload)
++        payload.setdefault("event", name)
++        payload.setdefault("run_id", run_id)
++        if session_id:
++            payload.setdefault("session_id", session_id)
++        payload.setdefault("timestamp", time.time())
++        try:
++            self._response_store.put_session_run_event(run_id, name, payload)
++        except Exception:
++            logger.debug("[api_server] failed to persist run event", exc_info=True)
++        if session_id:
++            self._sync_notifier.notify(session_id)
++
++    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", session_id: Optional[str]):
+         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+         def _push(event: Dict[str, Any]) -> None:
+             self._set_run_status(
+@@ -5955,6 +5986,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 self._run_statuses.get(run_id, {}).get("status", "running"),
+                 last_event=event.get("event"),
+             )
++            self._emit_run_event(run_id, session_id, str(event.get("event")), event)
+             q = self._run_streams.get(run_id)
+             if q is None:
+                 return
+@@ -6094,8 +6126,12 @@ class APIServerAdapter(BasePlatformAdapter):
+         self._run_streams[run_id] = q
+         self._run_streams_created[run_id] = created_at
+         self._run_approval_sessions[run_id] = approval_session_key
++        # Durable run record: events also persist in ResponseStore and reach
++        # any number of clients via /api/sessions/{id}/subscribe.
++        self._response_store.create_session_run(run_id, session_id, user_message)
++        self._sync_notifier.notify(session_id)
+ 
+-        event_cb = self._make_run_event_callback(run_id, loop)
++        event_cb = self._make_run_event_callback(run_id, loop, session_id)
+ 
+         # Also wire stream_delta_callback so message.delta events flow through.
+         def _text_cb(delta: Optional[str]) -> None:
+@@ -6110,6 +6146,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 })
+             except Exception:
+                 pass
++            self._emit_run_event(run_id, session_id, "message.delta", {"delta": delta})
+ 
+         self._set_run_status(
+             run_id,
+@@ -6132,6 +6169,12 @@ class APIServerAdapter(BasePlatformAdapter):
+         async def _run_and_close():
+             try:
+                 self._set_run_status(run_id, "running")
++                self._emit_run_event(
++                    run_id,
++                    session_id,
++                    "run.started",
++                    {"status": "running", "model": response_model_name},
++                )
+                 self._record_run_session_event(
+                     session_id=session_id,
+                     event_type="run.running",
+@@ -6159,15 +6202,21 @@ class APIServerAdapter(BasePlatformAdapter):
+                         "timestamp": time.time(),
+                         "choices": ["once", "session", "always", "deny"],
+                     })
++                    # Stash the redacted request in the pollable status so a
++                    # client that only does GET /v1/runs/{id} still discovers
++                    # what needs approving; /subscribe clients get the durable
++                    # event as well.
+                     self._set_run_status(
+                         run_id,
+                         "waiting_for_approval",
+                         last_event="approval.request",
++                        pending_approval=event,
+                     )
+                     try:
+                         loop.call_soon_threadsafe(q.put_nowait, event)
+                     except Exception:
+                         pass
++                    self._emit_run_event(run_id, session_id, "approval.request", event)
+ 
+                 def _run_sync():
+                     from gateway.session_context import clear_session_vars
+@@ -6257,6 +6306,9 @@ class APIServerAdapter(BasePlatformAdapter):
+                         "timestamp": time.time(),
+                         "error": error_msg,
+                     })
++                    self._emit_run_event(
++                        run_id, session_id, "run.failed", {"error": error_msg}
++                    )
+                     self._set_run_status(
+                         run_id,
+                         "failed",
+@@ -6282,6 +6334,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                         "output": final_response,
+                         "usage": usage,
+                     })
++                    self._emit_run_event(
++                        run_id,
++                        session_id,
++                        "run.completed",
++                        {"output": final_response, "usage": usage},
++                    )
+                     self._set_run_status(
+                         run_id,
+                         "completed",
+@@ -6314,6 +6372,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                     })
+                 except Exception:
+                     pass
++                self._emit_run_event(run_id, session_id, "run.cancelled", {})
+                 self._record_run_session_event(
+                     session_id=session_id,
+                     event_type="run.cancelled",
+@@ -6341,6 +6400,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                     })
+                 except Exception:
+                     pass
++                self._emit_run_event(
++                    run_id,
++                    session_id,
++                    "run.failed",
++                    {"error": _redact_api_error_text(exc)},
++                )
+                 self._record_run_session_event(
+                     session_id=session_id,
+                     event_type="run.failed",
+@@ -6385,7 +6450,9 @@ class APIServerAdapter(BasePlatformAdapter):
+             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
+         )
+         return web.json_response(
+-            {"run_id": run_id, "status": "started"},
++            # session_id lets the client attach to the run's durable event
++            # stream via GET /api/sessions/{session_id}/subscribe.
++            {"run_id": run_id, "status": "started", "session_id": session_id},
+             status=202,
+             headers=response_headers,
+         )
+@@ -6522,7 +6589,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                 status=409,
+             )
+ 
+-        self._set_run_status(run_id, "running", last_event="approval.responded")
++        self._set_run_status(
++            run_id,
++            "running",
++            last_event="approval.responded",
++            pending_approval=None,
++        )
+         q = self._run_streams.get(run_id)
+         if q is not None:
+             try:
+@@ -6535,6 +6607,12 @@ class APIServerAdapter(BasePlatformAdapter):
+                 })
+             except Exception:
+                 pass
++        self._emit_run_event(
++            run_id,
++            status.get("session_id"),
++            "approval.responded",
++            {"choice": choice, "resolved": resolved},
++        )
+ 
+         return web.json_response({
+             "object": "hermes.run.approval_response",
+@@ -6592,6 +6670,13 @@ class APIServerAdapter(BasePlatformAdapter):
+                 run_id
+                 for run_id, created_at in list(self._run_streams_created.items())
+                 if now - created_at > self._RUN_STREAM_TTL
++                # A live task cleans up after itself in _run_and_close's
++                # finally block; only sweep entries whose task is gone or
++                # finished without doing so.
++                and (
++                    self._active_run_tasks.get(run_id) is None
++                    or self._active_run_tasks[run_id].done()
++                )
+             ]
+             for run_id in stale:
+                 logger.debug("[api_server] sweeping orphaned run %s", run_id)
+diff --git a/tests/gateway/test_api_server_runs.py b/tests/gateway/test_api_server_runs.py
+index 41c4c64d0..d67bb1624 100644
+--- a/tests/gateway/test_api_server_runs.py
++++ b/tests/gateway/test_api_server_runs.py
+@@ -3,7 +3,7 @@
+ Covers:
+ - POST /v1/runs — start a run (202)
+ - GET /v1/runs/{run_id} — poll run status
+-- GET /v1/runs/{run_id}/events — SSE event stream
++- Durable run events in ResponseStore (observed via /api/sessions/{id}/subscribe)
+ - POST /v1/runs/{run_id}/stop — interrupt a running agent
+ - Auth, error handling, and cleanup
+ """
+@@ -197,6 +197,7 @@ class TestStartRun:
+             )
+         assert resp.status == 400
+         assert adapter._run_streams == {}
++        assert adapter._active_run_tasks == {}
+         assert adapter._run_statuses == {}
+ 
+     @pytest.mark.asyncio
+@@ -344,6 +345,8 @@ class TestRunStatus:
+ 
+ # ---------------------------------------------------------------------------
+ # GET /v1/runs/{run_id}/events — SSE event stream
++# (run events are also persisted durably in ResponseStore, observable via
++# /api/sessions/{session_id}/subscribe)
+ # ---------------------------------------------------------------------------
+ 
+ 
+@@ -376,7 +379,45 @@ class TestRunEvents:
+                 assert "run.completed" in body
+                 assert "Hello!" in body
+ 
++    @pytest.mark.asyncio
++    async def test_run_events_persisted_durably_and_status_pollable(self, adapter):
++        """Run lifecycle events land in ResponseStore so any client can
++        replay them (via /subscribe) after the run — no live stream needed."""
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent") as mock_create:
++                mock_agent = MagicMock()
++                mock_agent.run_conversation.return_value = {"final_response": "Hello!"}
++                mock_agent.session_prompt_tokens = 10
++                mock_agent.session_completion_tokens = 5
++                mock_agent.session_total_tokens = 15
++                mock_create.return_value = mock_agent
+ 
++                resp = await cli.post("/v1/runs", json={"input": "hello"})
++                assert resp.status == 202
++                data = await resp.json()
++                run_id = data["run_id"]
++                # The 202 exposes the session to subscribe to.
++                assert data["session_id"]
++
++                for _ in range(100):
++                    status_resp = await cli.get(f"/v1/runs/{run_id}")
++                    status = await status_resp.json()
++                    if status["status"] == "completed":
++                        break
++                    await asyncio.sleep(0.05)
++                assert status["status"] == "completed"
++
++        stored_run = adapter._response_store.get_session_run(run_id)
++        assert stored_run is not None
++        assert stored_run["status"] == "completed"
++        assert stored_run["session_id"] == data["session_id"]
++        events = adapter._response_store.list_session_run_events(run_id)
++        event_names = [e["event"] for e in events]
++        assert "run.started" in event_names
++        assert "run.completed" in event_names
++        completed = next(e for e in events if e["event"] == "run.completed")
++        assert completed["payload"]["output"] == "Hello!"
+ 
+     @pytest.mark.asyncio
+     async def test_approval_response_without_pending_returns_409(self, adapter):
+@@ -427,6 +468,66 @@ class TestRunEvents:
+             resolve_all=False,
+         )
+ 
++    @pytest.mark.asyncio
++    async def test_approval_flow_surfaces_in_status_and_durable_events(self, adapter):
++        """approval.request must reach status-polling clients (pending_approval
++        on GET /v1/runs/{id}) and durable replay (ResponseStore), since the
++        single-consumer events stream that used to carry it was removed."""
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent") as mock_create:
++                mock_agent, agent_ready, _ = _make_slow_agent()
++                mock_create.return_value = mock_agent
++
++                resp = await cli.post("/v1/runs", json={"input": "hello"})
++                assert resp.status == 202
++                run_id = (await resp.json())["run_id"]
++                agent_ready.wait(timeout=3.0)
++
++                # The run registered its approval notify hook; fire it the way
++                # the approval core does when a tool needs sign-off.
++                for _ in range(50):
++                    notify_cb = approval_mod._gateway_notify_cbs.get(run_id)
++                    if notify_cb is not None:
++                        break
++                    await asyncio.sleep(0.05)
++                assert notify_cb is not None
++                notify_cb({"command": "rm -rf /tmp/scratch", "tool": "terminal"})
++
++                status_resp = await cli.get(f"/v1/runs/{run_id}")
++                status = await status_resp.json()
++                assert status["status"] == "waiting_for_approval"
++                assert status["pending_approval"]["event"] == "approval.request"
++                assert status["pending_approval"]["choices"] == [
++                    "once", "session", "always", "deny",
++                ]
++
++                event_names = [
++                    e["event"]
++                    for e in adapter._response_store.list_session_run_events(run_id)
++                ]
++                assert "approval.request" in event_names
++
++                with patch("tools.approval.resolve_gateway_approval", return_value=1):
++                    approval_resp = await cli.post(
++                        f"/v1/runs/{run_id}/approval", json={"choice": "once"}
++                    )
++                assert approval_resp.status == 200
++
++                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
++                assert status["status"] == "running"
++                assert "pending_approval" not in status
++
++                event_names = [
++                    e["event"]
++                    for e in adapter._response_store.list_session_run_events(run_id)
++                ]
++                assert "approval.responded" in event_names
++
++                # Unblock the slow agent so teardown doesn't wait out the
++                # 10s interrupt timeout.
++                mock_agent.interrupt()
++
+     @pytest.mark.asyncio
+     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+         """Same client session_id must not let one run approve another run's queue."""
+@@ -497,7 +598,6 @@ class TestRunEvents:
+                 victim_interrupted.set()
+                 attacker_interrupted.set()
+ 
+-
+     @pytest.mark.asyncio
+     async def test_events_not_found_returns_404(self, adapter):
+         app = _create_runs_app(adapter)
+@@ -670,3 +770,43 @@ class TestStopRun:
+                 body = await events_resp.text()
+                 # Stream should have received run.failed and closed
+                 assert "run.failed" in body or "stream closed" in body
++
++    @pytest.mark.asyncio
++    async def test_stop_records_terminal_durable_event(self, adapter):
++        """After stop, the durable run record must reach a terminal state so
++        subscribers/replayers don't render the run as live forever."""
++        app = _create_runs_app(adapter)
++        async with TestClient(TestServer(app)) as cli:
++            with patch.object(adapter, "_create_agent") as mock_create:
++                mock_agent, agent_ready, _ = _make_slow_agent()
++                mock_create.return_value = mock_agent
++
++                # Start run
++                resp = await cli.post("/v1/runs", json={"input": "hello"})
++                assert resp.status == 202
++                data = await resp.json()
++                run_id = data["run_id"]
++
++                agent_ready.wait(timeout=3.0)
++                await asyncio.sleep(0.1)
++
++                # Stop the run
++                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
++                assert stop_resp.status == 200
++
++                terminal = {"completed", "failed", "interrupted"}
++                for _ in range(100):
++                    stored = adapter._response_store.get_session_run(run_id)
++                    if stored and stored["status"] in terminal:
++                        break
++                    await asyncio.sleep(0.05)
++                assert stored is not None
++                assert stored["status"] in terminal
++                event_names = [
++                    e["event"]
++                    for e in adapter._response_store.list_session_run_events(run_id)
++                ]
++                assert any(
++                    name in {"run.completed", "run.failed", "run.cancelled"}
++                    for name in event_names
++                )
+-- 
+2.52.0
+

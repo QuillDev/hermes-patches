@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quill <quill@example.com>
 Date: Sat, 27 Jun 2026 18:53:01 -0700
-Subject: [PATCH 19/23] fix: speed up interactive CLI startup
+Subject: [PATCH 17/19] fix: speed up interactive CLI startup
 
 Keep omitted --compact as None so HermesCLI can honor display.compact. Add display.startup_banner and display.startup_status toggles for users who want the fastest path to the prompt.
 
@@ -10,7 +10,7 @@ For bare interactive chat, defer plugin discovery, shell-hook registration, and 
 Co-authored-by: Nako <280596805+nakoagent@users.noreply.github.com>
 
 diff --git a/cli.py b/cli.py
-index b5900da71..9039f6f41 100644
+index b5900da71..058539b40 100644
 --- a/cli.py
 +++ b/cli.py
 @@ -937,7 +937,7 @@ def _mark_tui_input_modes_active() -> None:
@@ -22,15 +22,6 @@ index b5900da71..9039f6f41 100644
      global _deferred_agent_startup_done
      if _deferred_agent_startup_done:
          return
-@@ -964,7 +964,7 @@ def _prepare_deferred_agent_startup() -> None:
- 
-         start_background_mcp_discovery(
-             logger=logger,
--            thread_name="termux-cli-mcp-discovery",
-+            thread_name="deferred-cli-mcp-discovery",
-         )
-     except Exception:
-         logger.debug(
 @@ -3599,7 +3599,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
          base_url: str = None,
          max_turns: int = None,
